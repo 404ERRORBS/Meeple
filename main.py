@@ -2121,7 +2121,7 @@ def config_overview_embed(guild: discord.Guild, config: dict) -> discord.Embed:
     e.add_field(name="📹 Video / Reaction",     value=f"**{cur(config, config.get('reaction_xp', 50))}**", inline=True)
     e.add_field(name="📨 Invite",              value=f"**{cur(config, config.get('invite_xp', 25))}**",   inline=True)
     e.add_field(name="🔥 Streak",              value="Enabled" if config.get("streak_enabled", 1) else "Disabled", inline=True)
-    e.set_footer(text="Select a category below to edit settings | Click 📊 Status for full details")
+    e.set_footer(text="Select a category below to edit settings")
     return e
 
 def config_status_embed(guild: discord.Guild, config: dict) -> discord.Embed:
@@ -2282,21 +2282,27 @@ async def send_welcome_dm(member: discord.Member, config: dict, trigger: str = "
     dm_sent = False
     dm_error = ""
     try:
-        await asyncio.sleep(0.5)   # Small delay to avoid rate limits
-        await member.send(embed=e)
+        # For join trigger Discord needs extra time before the member is fully registered.
+        delay = 3 if trigger == "join" else 0.5
+        await asyncio.sleep(delay)
+        # Explicitly create the DM channel first — avoids 403 issues in some discord.py versions.
+        dm_channel = await member.create_dm()
+        await dm_channel.send(embed=e)
         dm_sent = True
     except discord.Forbidden as ex:
-        # HTTP 403 / code 50007 — most common reasons:
-        #   1. The member has "Allow direct messages from server members" OFF
-        #      in their Discord Server Settings → Privacy for THIS specific server.
-        #      (This is different from their global DM setting.)
-        #   2. The member has the bot blocked.
-        # Fix: ask the member to open Discord → Server name → right-click → Privacy Settings →
-        # enable "Allow direct messages from server members".
-        dm_error = (
-            f"Forbidden (HTTP 403, code {ex.code})\n"
-            f"Fix: member must open Server Settings → Privacy → enable **Allow DMs from server members**."
-        )
+        # Common reasons for 403:
+        #   code 50007 / 20026 — the member has "Allow direct messages from server members"
+        #     OFF in their Discord server privacy settings for THIS specific server.
+        #     (Different from global DM settings.)
+        #   code 50007 — the member has blocked the bot.
+        if ex.code in (50007, 20026):
+            dm_error = (
+                f"Forbidden (HTTP 403, code {ex.code}) — DMs are disabled.\n"
+                f"Fix: member must right-click the server → Privacy Settings → "
+                f"enable **Allow direct messages from server members**."
+            )
+        else:
+            dm_error = f"Forbidden (HTTP 403, code {ex.code}): {ex.text}"
     except discord.HTTPException as ex:
         dm_error = f"HTTPException (status {ex.status}, code {ex.code}): {ex.text}"
     except Exception as ex:
@@ -2373,11 +2379,7 @@ class ConfigMainMenu(discord.ui.View):
         sub = ConfigPermissionsMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
-    @discord.ui.button(label="📊 Status",      style=discord.ButtonStyle.grey, row=1)
-    async def cat_status(self, i, b):
-        await i.response.edit_message(embed=config_status_embed(self.guild, db_get_config(self.guild.id)), view=self)
-
-    @discord.ui.button(label="📨 DMs & Welcome", style=discord.ButtonStyle.blurple, row=2)
+    @discord.ui.button(label="📨 DMs & Welcome", style=discord.ButtonStyle.blurple, row=1)
     async def cat_dms(self, i, b):
         sub = ConfigDMsMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
@@ -2438,10 +2440,10 @@ class ConfigMainMenu(discord.ui.View):
         e.add_field(name="6️⃣  Day-to-day: /admin", value=(
             "Use **/admin** to:\n"
             f"• **👤 Manage {c_name}** — add/remove/check a member's {c_name}\n"
-            "• **🛒 Manage Shop** — add/remove items quickly\n"
             "• **📢 Trigger Ping** — manually announce a video share window\n"
             "• **💾 Run Backup** — force an immediate DB backup\n"
-            "• **📊 Server Stats** — activity overview"
+            "• **📊 Server Stats** — activity overview\n"
+            "• **📨 Send DMs** — bulk-send welcome DMs (configure in /config → DMs & Welcome)"
         ), inline=False)
         e.add_field(name="7️⃣  Award reaction bonus", value=(
             "React with your configured emoji (default ✅) on any member's message.\n"
@@ -2779,7 +2781,7 @@ class ConfigDMsMenu(_SubMenu):
             "**Purchase DM** — enable/disable DM notifications when a purchase ticket opens\n"
             "**Purchase DM Role** — role that receives purchase DMs (default: Meeple Owner)\n"
             "**Notif Prompt Cooldown** — days before the 🔔 notification prompt reappears after 'Later'\n"
-            "**Bulk DM Role** — role whose members receive the welcome DM when you press **Send DMs** in /admin"
+            "**Bulk DM Role** — role whose members receive the welcome DM when you press **📨 Send DMs** below"
         ), inline=False)
         return e
 
@@ -2966,7 +2968,7 @@ class ConfigDMsMenu(_SubMenu):
                 db_set_config(self.guild.id, bulk_dm_role_id=rid)
                 await inter.response.send_message(
                     f"✅ Bulk DM role set to <@&{rid}>.\n"
-                    "Use **Send DMs** in /admin to send the welcome DM to all members with this role.",
+                    "Use **📨 Send DMs** below to send the welcome DM to all members with this role.",
                     ephemeral=True)
             await self._refresh(interaction)
         await interaction.response.send_modal(Modal1(
@@ -3012,6 +3014,47 @@ class ConfigDMsMenu(_SubMenu):
             default=str(config.get("purchase_dm_role_id") or ""),
             required=False, callback=submit
         ))
+
+    @discord.ui.button(label="📨 Send DMs",              style=discord.ButtonStyle.green,   row=4)
+    async def btn_send_dms(self, i: discord.Interaction, b):
+        """Send the welcome DM to all members of the configured Bulk DM Role."""
+        await i.response.defer(ephemeral=True)
+        config = db_get_config(self.guild.id)
+        bulk_role_id = config.get("bulk_dm_role_id")
+        if not bulk_role_id:
+            await i.followup.send(
+                "❌ No Bulk DM Role configured.\n"
+                "Use **Bulk DM Role** above to set the role first.",
+                ephemeral=True)
+            return
+        role = self.guild.get_role(bulk_role_id)
+        if not role:
+            await i.followup.send("❌ Role not found — it may have been deleted.", ephemeral=True)
+            return
+        members_to_dm = [m for m in role.members if not m.bot]
+        if not members_to_dm:
+            await i.followup.send(f"❌ No members found with <@&{bulk_role_id}>.", ephemeral=True)
+            return
+        await i.followup.send(
+            f"📨 Sending welcome DM to **{len(members_to_dm)}** member(s) with <@&{bulk_role_id}>…",
+            ephemeral=True)
+        sent = 0
+        failed = 0
+        for member in members_to_dm:
+            success = await send_welcome_dm(member, config, trigger="bulk")
+            if success:
+                sent += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.6)
+        await i.followup.send(
+            f"✅ Done — **{sent}** DM(s) sent, **{failed}** failed.\n"
+            + (f"⚠️ {failed} member(s) may have DMs disabled — check the log channel for details." if failed else ""),
+            ephemeral=True)
+        await bot_log(i.client, self.guild.id, "📨 Bulk DM Sent",
+                      f"**Triggered by:** {i.user.mention}\n"
+                      f"**Role:** <@&{bulk_role_id}>\n"
+                      f"**Sent:** {sent} | **Failed:** {failed}", C_INFO)
 
 
 class ConfigCurrencyMenu(_SubMenu):
@@ -4384,7 +4427,7 @@ class ConfigPermissionsMenu(_SubMenu):
 
 def admin_main_embed(guild: discord.Guild) -> discord.Embed:
     e = E(f"🛠️ Admin Panel — {guild.name}", color=C_INFO)
-    e.description = "Manage balances, shop, announcements, backups, and community goals."
+    e.description = "Manage balances, announcements, backups, and community goals."
     return e
 
 class AdminMainMenu(discord.ui.View):
@@ -4405,11 +4448,6 @@ class AdminMainMenu(discord.ui.View):
     @discord.ui.button(label="👤 Manage Balance",    style=discord.ButtonStyle.blurple, row=0)
     async def cat_xp(self, i, b):
         sub = AdminXPMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(), sub)
-
-    @discord.ui.button(label="🛒 Manage Shop",      style=discord.ButtonStyle.blurple, row=0)
-    async def cat_shop(self, i, b):
-        sub = AdminShopMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(), sub)
 
     @discord.ui.button(label="📢 Trigger Ping",     style=discord.ButtonStyle.blurple, row=0)
@@ -4441,47 +4479,6 @@ class AdminMainMenu(discord.ui.View):
             await inter.edit_original_response(content="✅ Ping sent to share channel!")
         await i.response.send_modal(Modal1("Trigger Share Ping", "YouTube video URL",
             placeholder="https://www.youtube.com/watch?v=xxxx  or  shorts/xxxx", callback=submit))
-
-    @discord.ui.button(label="📨 Send DMs",          style=discord.ButtonStyle.grey, row=0)
-    async def cat_send_dms(self, i: discord.Interaction, b):
-        """Send the welcome DM to all members of the configured Bulk DM Role."""
-        await i.response.defer(ephemeral=True)
-        config = db_get_config(self.guild.id)
-        bulk_role_id = config.get("bulk_dm_role_id")
-        if not bulk_role_id:
-            await i.followup.send(
-                "❌ No Bulk DM Role set.\n"
-                "Go to **`/config → 📨 DMs & Welcome → Bulk DM Role`** to configure it.",
-                ephemeral=True)
-            return
-        role = self.guild.get_role(bulk_role_id)
-        if not role:
-            await i.followup.send("❌ Role not found — it may have been deleted.", ephemeral=True)
-            return
-        members_to_dm = [m for m in role.members if not m.bot]
-        if not members_to_dm:
-            await i.followup.send(f"❌ No members found with the role <@&{bulk_role_id}>.", ephemeral=True)
-            return
-        await i.followup.send(
-            f"📨 Sending welcome DM to **{len(members_to_dm)}** member(s) with <@&{bulk_role_id}>…",
-            ephemeral=True)
-        sent = 0
-        failed = 0
-        for member in members_to_dm:
-            success = await send_welcome_dm(member, config, trigger="bulk")
-            if success:
-                sent += 1
-            else:
-                failed += 1
-            await asyncio.sleep(0.6)   # avoid rate-limits
-        await i.followup.send(
-            f"✅ Done — **{sent}** DM(s) sent, **{failed}** failed.\n"
-            + (f"❌ {failed} member(s) have DMs disabled — check the log channel for details." if failed else ""),
-            ephemeral=True)
-        await bot_log(i.client, self.guild.id, "📨 Bulk DM Sent",
-                      f"**Triggered by:** {i.user.mention}\n"
-                      f"**Role:** <@&{bulk_role_id}>\n"
-                      f"**Sent:** {sent} | **Failed:** {failed}", C_INFO)
 
     @discord.ui.button(label="💾 Run Backup",       style=discord.ButtonStyle.grey, row=1)
     async def cat_backup(self, i: discord.Interaction, b):
@@ -4572,15 +4569,20 @@ class AdminMainMenu(discord.ui.View):
         e.add_field(name="6️⃣  Day-to-day: /admin", value=(
             "Use **/admin** to:\n"
             f"• **👤 Manage {c_name}** — add/remove/check a member's {c_name}\n"
-            "• **🛒 Manage Shop** — add/remove items quickly\n"
             "• **📢 Trigger Ping** — manually announce a video share window\n"
-            "• **💾 Run Backup** — force an immediate backup\n"
+            "• **💾 Run Backup** — force an immediate DB backup\n"
             "• **📊 Server Stats** — activity overview"
         ), inline=False)
         e.add_field(name="7️⃣  Award reaction bonus", value=(
             "React with your configured emoji (default ✅) on any member's message.\n"
             f"They earn **+{cur(config, config.get('reaction_xp', 50))}** instantly.\n"
             "Remove your reaction to take it back (within the cooldown window)."
+        ), inline=False)
+        e.add_field(name="8️⃣  Welcome DMs & bulk send", value=(
+            "Go to **📨 DMs & Welcome** in /config to enable welcome DMs for new members.\n"
+            "Set a **Bulk DM Role** and click **📨 Send DMs** there to bulk-DM all members at once.\n"
+            "If DMs fail (403), the member must enable: Server name → right-click → Privacy Settings "
+            "→ Allow direct messages from server members."
         ), inline=False)
         e.set_footer(text="Tip: all settings auto-save. You can reopen /config any time to review.")
         await i.response.send_message(embed=e, ephemeral=True)
@@ -6390,7 +6392,7 @@ class PingRoleOptInView(discord.ui.View):
 
 async def _prompt_ping_role(interaction: discord.Interaction) -> None:
     """After any user command, nudge members who don't have the ping role yet.
-    Skipped if the user snoozed the prompt with the 'Later' button."""
+    Skipped if the user snoozed the prompt or if it was already shown recently."""
     if not isinstance(interaction.user, discord.Member) or not interaction.guild:
         return
     config  = db_get_config(interaction.guild_id)
@@ -6402,13 +6404,19 @@ async def _prompt_ping_role(interaction: discord.Interaction) -> None:
         return
     if db_is_notification_snoozed(interaction.guild_id, interaction.user.id):
         return
-    # Use minutes-based cooldown; fall back to legacy days column if minutes not set.
-    # Fix: treat 0 as "always show" — do not replace it with the default 3-day value.
+    # Resolve the configured cooldown (minutes). 0 = always show (minimum 1-minute debounce).
     cooldown_minutes = config.get("notify_prompt_cooldown_minutes")
     if cooldown_minutes is None:
         legacy_days = config.get("notify_prompt_cooldown_days")
         cooldown_minutes = (3 if legacy_days is None else legacy_days) * 24 * 60
     cooldown_minutes = int(cooldown_minutes)
+
+    # Set a short debounce snooze so the prompt doesn't re-appear on every consecutive
+    # command within the same session. "Later" click extends to the full configured cooldown.
+    # Use 1 minute for cooldown=0 ("always show"), otherwise use the configured value.
+    debounce = max(1, cooldown_minutes)
+    db_snooze_notification(interaction.guild_id, interaction.user.id, debounce)
+
     try:
         await interaction.followup.send(
             f"🔔 **Want to be notified when a new video drops?**\n"
@@ -6417,9 +6425,12 @@ async def _prompt_ping_role(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
     except discord.NotFound:
-        pass   # interaction token expired — skip silently
+        # Interaction token expired — undo the snooze so it can try again next command.
+        db_snooze_notification(interaction.guild_id, interaction.user.id, 0)
     except discord.HTTPException as _e:
-        print(f"[NotifyPrompt] followup.send failed: {_e}")
+        print(f"[NotifyPrompt] followup.send failed (code {_e.code}): {_e}")
+        # Undo debounce so the next command can retry.
+        db_snooze_notification(interaction.guild_id, interaction.user.id, 0)
 
 # ── /config ───────────────────────────────────────────────────
 
