@@ -455,6 +455,34 @@ def init_db():
     conn.execute("UPDATE guild_config SET currency_emoji='💎' WHERE currency_emoji IS NULL")
     conn.execute("UPDATE guild_config SET currency_name='Gems' WHERE currency_name IS NULL")
     conn.commit()
+
+    # Fix daily_quests PRIMARY KEY — original schema only had (guild_id, user_id, date_key),
+    # which silently drops all but the first quest per user per day.
+    # Recreate with (guild_id, user_id, date_key, quest_key) to allow 3 quests per day.
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_quests_v2 (
+                guild_id     INTEGER,
+                user_id      INTEGER,
+                date_key     TEXT,
+                quest_key    TEXT,
+                quest_type   TEXT,
+                quest_target INTEGER,
+                quest_name   TEXT,
+                progress     INTEGER DEFAULT 0,
+                completed    INTEGER DEFAULT 0,
+                xp_awarded   INTEGER DEFAULT 0,
+                dm_sent      INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id, date_key, quest_key)
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO daily_quests_v2 SELECT * FROM daily_quests")
+        conn.execute("DROP TABLE daily_quests")
+        conn.execute("ALTER TABLE daily_quests_v2 RENAME TO daily_quests")
+        conn.commit()
+    except Exception:
+        pass
+
     conn.close()
 
 # ── Config helpers ─────────────────────────────────────────────
@@ -1731,6 +1759,61 @@ async def process_quest_completions(bot: commands.Bot, guild_id: int, user_id: i
                       f"**Reward:** +{cur(config, xp_reward)}", RARITY_COLOR[rarity])
         # Check achievements after quest completion
         await check_achievements(bot, guild_id, user_id)
+
+async def process_daily_quest_completions(bot: commands.Bot, guild_id: int, user_id: int,
+                                          newly_done_keys: list, date_key: str):
+    """Award XP and announce newly completed daily quests in the quests (or notification) channel."""
+    if not newly_done_keys:
+        return
+    config   = db_get_config(guild_id)
+    quest_xp = config.get("daily_quest_xp", 50)
+    guild    = bot.get_guild(guild_id)
+    member   = guild.get_member(user_id) if guild else None
+
+    ch_id = config.get("quests_channel_id") or config.get("notification_channel_id")
+    ch    = bot.get_channel(ch_id) if ch_id else None
+
+    for quest_key in newly_done_keys:
+        quest_def  = next((q for q in DAILY_QUEST_POOL if q["key"] == quest_key), None)
+        quest_name = quest_def["name"] if quest_def else quest_key
+
+        # Award XP (only if not already awarded for this quest)
+        conn = get_db()
+        row  = conn.execute(
+            "SELECT xp_awarded FROM daily_quests WHERE guild_id=? AND user_id=? AND date_key=? AND quest_key=?",
+            (guild_id, user_id, date_key, quest_key)
+        ).fetchone()
+        already = row and row["xp_awarded"]
+        if not already:
+            conn.execute(
+                "UPDATE daily_quests SET xp_awarded=? WHERE guild_id=? AND user_id=? AND date_key=? AND quest_key=?",
+                (quest_xp, guild_id, user_id, date_key, quest_key)
+            )
+            conn.commit()
+            conn.close()
+            db_add_xp(guild_id, user_id, quest_xp)
+        else:
+            conn.close()
+
+        # Announce in quests / notification channel
+        e = E("📋 Daily Quest Complete!",
+              f"**{quest_name}**\nReward: **+{cur(config, quest_xp)}**",
+              C_QUEST)
+        if member:
+            e.set_author(name=str(member),
+                         icon_url=member.display_avatar.url if member.display_avatar else None)
+        if ch:
+            try:
+                await ch.send(embed=e)
+            except Exception:
+                pass
+
+        # Structured log
+        await bot_log(bot, guild_id, "📋 Daily Quest Complete",
+                      f"**Member:** {member.mention if member else f'<@{user_id}>'}\n"
+                      f"**Quest:** {quest_name}\n"
+                      f"**Reward:** +{cur(config, quest_xp)}", C_QUEST)
+
 
 async def check_achievements(bot: commands.Bot, guild_id: int, user_id: int):
     """Check and unlock achievements based on current stats."""
@@ -5707,6 +5790,11 @@ async def on_member_join(member: discord.Member):
                 # Update quest progress
                 newly_done = db_update_quest_progress(guild_id, inviter_id, "invite_members")
                 await process_quest_completions(bot, guild_id, inviter_id, newly_done)
+                # Daily quest progress for inviter
+                if db_get_config(guild_id).get("daily_quest_enabled", 0):
+                    dq_date = db_today_key()
+                    dq_done = db_daily_quest_progress(guild_id, inviter_id, dq_date, "dq_invite")
+                    await process_daily_quest_completions(bot, guild_id, inviter_id, dq_done, dq_date)
                 # Check achievements
                 await check_achievements(bot, guild_id, inviter_id)
                 # Notify XP channel
@@ -6045,6 +6133,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                   f"**Amount:** +{cur(config_r, xp_to_give)}{mult_str}\n"
                   f"**Balance:** {cur(config_r, new_xp)}"
                   + (f"\n**Streak:** 🔥{streak_updated}" if streak_updated else ""), C_SUCCESS)
+    # Daily quest: actor gets credit for awarding a reaction bonus
+    if config_r.get("daily_quest_enabled", 0):
+        dq_date = db_today_key()
+        dq_done = db_daily_quest_progress(payload.guild_id, actor.id, dq_date, "dq_react")
+        await process_daily_quest_completions(bot, payload.guild_id, actor.id, dq_done, dq_date)
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
@@ -6274,6 +6367,20 @@ async def _handle_share(message: discord.Message, config: dict):
     if position == 1:
         newly_done += db_update_quest_progress(guild_id, message.author.id, "top_1")
     await process_quest_completions(bot, guild_id, message.author.id, newly_done)
+    # Daily quest progress
+    if config.get("daily_quest_enabled", 0):
+        date_key = db_today_key()
+        dq_done: list = []
+        dq_done += db_daily_quest_progress(guild_id, message.author.id, date_key, "dq_share")
+        if position <= 10:
+            dq_done += db_daily_quest_progress(guild_id, message.author.id, date_key, "dq_top10")
+        if position <= 5:
+            dq_done += db_daily_quest_progress(guild_id, message.author.id, date_key, "dq_first5")
+        if position <= 3:
+            dq_done += db_daily_quest_progress(guild_id, message.author.id, date_key, "dq_first3")
+        if position == 1:
+            dq_done += db_daily_quest_progress(guild_id, message.author.id, date_key, "dq_first1")
+        await process_daily_quest_completions(bot, guild_id, message.author.id, dq_done, date_key)
     # Community goal contributions
     active_goals = db_get_community_goals(guild_id)
     for goal in active_goals:
@@ -6500,6 +6607,13 @@ async def cmd_gems(interaction: discord.Interaction, member: Optional[discord.Me
         e.add_field(name="🔥 Streak",value=f"**{streak['current_streak']}**"
                     + (f" (max: {streak['max_streak']})" if streak["max_streak"] else ""), inline=True)
     await interaction.response.send_message(embed=e)
+    # Daily quest: "Check your balance with /gems" (only for own balance check)
+    if target.id == interaction.user.id:
+        config2 = db_get_config(interaction.guild_id)
+        if config2.get("daily_quest_enabled", 0):
+            dq_date = db_today_key()
+            dq_done = db_daily_quest_progress(interaction.guild_id, interaction.user.id, dq_date, "dq_checkin")
+            await process_daily_quest_completions(bot, interaction.guild_id, interaction.user.id, dq_done, dq_date)
     await _prompt_ping_role(interaction)
 
 # ── /leaderboard ─────────────────────────────────────────────
@@ -6756,7 +6870,36 @@ async def cmd_quests(interaction: discord.Interaction):
             value=f"Boost the server → **+{cur(config, config.get('boost_quest_xp', 100))}** per boost\n♾️ Unlimited completions",
             inline=False
         )
-    await interaction.response.send_message(embed=e)
+    # ── Daily quests section ──────────────────────────────────────
+    if config.get("daily_quest_enabled", 0):
+        date_key  = db_today_key()
+        dq_xp     = config.get("daily_quest_xp", 50)
+        daily_qs  = db_assign_daily_quests(guild_id, user_id, date_key, count=3)
+        e.add_field(name="─" * 32, value="", inline=False)
+        e.add_field(
+            name=f"📋 Daily Quests — {date_key}",
+            value=f"Complete these today to earn **{cur(config, dq_xp)}** each.",
+            inline=False
+        )
+        for dq in daily_qs:
+            tgt = dq["quest_target"] or 1
+            prog_pct  = min(dq["progress"] / tgt, 1.0)
+            bar_filled = int(prog_pct * 10)
+            bar = "█" * bar_filled + "░" * (10 - bar_filled)
+            status    = "✅ **COMPLETE**" if dq["completed"] else f"`{bar}` {dq['progress']}/{tgt}"
+            reward_str = f"**{cur(config, dq_xp)}**" + (" *(claimed)*" if dq.get("xp_awarded") else "")
+            e.add_field(
+                name=f"• {dq['quest_name']}",
+                value=f"{status}\nReward: {reward_str}",
+                inline=False
+            )
+        # Track "View your quests with /quests" daily quest
+        dq_done = db_daily_quest_progress(guild_id, user_id, date_key, "dq_checkq")
+        # Send first so the user sees the embed before the follow-up completion announce
+        await interaction.response.send_message(embed=e)
+        await process_daily_quest_completions(bot, guild_id, user_id, dq_done, date_key)
+    else:
+        await interaction.response.send_message(embed=e)
     await _prompt_ping_role(interaction)
 
 # ── /achievements ─────────────────────────────────────────────
