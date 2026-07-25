@@ -121,18 +121,17 @@ QUEST_POOL = {
 
 # ── Daily quest pool — simple tasks achievable in one day ─────
 DAILY_QUEST_POOL = [
-    {"key": "dq_share_1",    "name": "Share today's video",            "type": "dq_share",   "target": 1},
-    {"key": "dq_first5",     "name": "Be among the first 5 to share",  "type": "dq_first5",  "target": 1},
-    {"key": "dq_first3",     "name": "Be among the first 3 to share",  "type": "dq_first3",  "target": 1},
-    {"key": "dq_first1",     "name": "Be the very first to share",     "type": "dq_first1",  "target": 1},
-    {"key": "dq_react",      "name": "Award a reaction bonus today",   "type": "dq_react",   "target": 1},
-    {"key": "dq_invite",     "name": "Invite 1 new member today",      "type": "dq_invite",  "target": 1},
-    {"key": "dq_check_gems", "name": "Check your balance with /gems",  "type": "dq_checkin", "target": 1},
-    {"key": "dq_check_q",    "name": "View your quests with /quests",  "type": "dq_checkq",  "target": 1},
-    {"key": "dq_share_top10","name": "Share and be in the top 10",     "type": "dq_top10",   "target": 1},
-    {"key": "dq_share_2",    "name": "Share at least 2 videos today",  "type": "dq_share",   "target": 2},
-    {"key": "dq_invite_2",   "name": "Invite 2 new members today",     "type": "dq_invite",  "target": 2},
-    {"key": "dq_react_3",    "name": "Award 3 reaction bonuses today", "type": "dq_react",   "target": 3},
+    {"key": "dq_share_1",    "name": "Share today's video",                  "type": "dq_share",    "target": 1},
+    {"key": "dq_first5",     "name": "Be among the first 5 to share",        "type": "dq_first5",   "target": 1},
+    {"key": "dq_first3",     "name": "Be among the first 3 to share",        "type": "dq_first3",   "target": 1},
+    {"key": "dq_first1",     "name": "Be the very first to share",           "type": "dq_first1",   "target": 1},
+    {"key": "dq_invite",     "name": "Invite a new member",                  "type": "dq_invite",   "target": 1},
+    {"key": "dq_check_gems", "name": "Check your balance with /gems",        "type": "dq_checkin",  "target": 1},
+    {"key": "dq_check_q",    "name": "View your quests with /quests",        "type": "dq_checkq",   "target": 1},
+    {"key": "dq_share_top10","name": "Share and be in the top 10",           "type": "dq_top10",    "target": 1},
+    {"key": "dq_get_react",  "name": "Get a reaction bonus from a Meeple Owner", "type": "dq_get_react", "target": 1},
+    # dq_messages: target is randomised (10–50) at assignment time — name updated accordingly
+    {"key": "dq_messages",   "name": "Send {n} messages in the chat",        "type": "dq_messages", "target": 20},
 ]
 
 # Achievement definitions — add entries to extend
@@ -441,6 +440,10 @@ def init_db():
         # Boost announce: role to mention + per-guild hourly rate-limit timestamp (unix)
         "ALTER TABLE guild_config ADD COLUMN boost_announce_role_id INTEGER",
         "ALTER TABLE guild_config ADD COLUMN boost_announce_cooldown_ts INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN boost_announce_channel_id INTEGER",
+        "ALTER TABLE guild_config ADD COLUMN server_tag_enabled INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN server_tag_xp INTEGER DEFAULT 100",
+        "ALTER TABLE guild_config ADD COLUMN daily_quest_messages_channel_id INTEGER",
         # Daily quests
         "ALTER TABLE guild_config ADD COLUMN daily_quest_enabled INTEGER DEFAULT 0",
         "ALTER TABLE guild_config ADD COLUMN daily_quest_role_id INTEGER",
@@ -455,6 +458,14 @@ def init_db():
     conn.execute("UPDATE guild_config SET currency_emoji='💎' WHERE currency_emoji IS NULL")
     conn.execute("UPDATE guild_config SET currency_name='Gems' WHERE currency_name IS NULL")
     conn.commit()
+
+    # Server tag rewards table — tracks who has already been rewarded for the server tag.
+    conn.execute("""CREATE TABLE IF NOT EXISTS server_tag_rewards (
+        guild_id INTEGER,
+        user_id  INTEGER,
+        rewarded_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (guild_id, user_id)
+    )""")
 
     # Fix daily_quests PRIMARY KEY — original schema only had (guild_id, user_id, date_key),
     # which silently drops all but the first quest per user per day.
@@ -900,11 +911,17 @@ def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: in
     chosen = _random.sample(DAILY_QUEST_POOL, min(count, len(DAILY_QUEST_POOL)))
     conn = get_db()
     for q in chosen:
+        target = q["target"]
+        name   = q["name"]
+        # dq_messages: randomise target between 10 and 50 each day
+        if q["type"] == "dq_messages":
+            target = _random.randint(10, 50)
+            name   = f"Send {target} messages in the chat"
         conn.execute(
             "INSERT OR IGNORE INTO daily_quests "
             "(guild_id, user_id, date_key, quest_key, quest_type, quest_target, quest_name) "
             "VALUES (?,?,?,?,?,?,?)",
-            (guild_id, user_id, date_key, q["key"], q["type"], q["target"], q["name"])
+            (guild_id, user_id, date_key, q["key"], q["type"], target, name)
         )
     conn.commit()
     conn.close()
@@ -2339,6 +2356,44 @@ async def post_or_update_info_embed(bot: commands.Bot, guild: discord.Guild, con
         return False, f"Error: {ex}"
 
 
+def member_has_server_tag(member: discord.Member) -> bool:
+    """Return True if the member has the server's clan/guild tag enabled (discord.py 2.4+)."""
+    return getattr(member, "guild_tag", None) is not None
+
+
+async def _reward_server_tag(guild: discord.Guild, member: discord.Member, config: dict):
+    """Award gems when a member enables the server tag for the first time."""
+    guild_id = guild.id
+    conn = get_db()
+    already = conn.execute(
+        "SELECT 1 FROM server_tag_rewards WHERE guild_id=? AND user_id=?",
+        (guild_id, member.id)
+    ).fetchone()
+    if already:
+        conn.close()
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO server_tag_rewards (guild_id, user_id) VALUES (?,?)",
+        (guild_id, member.id)
+    )
+    conn.commit()
+    conn.close()
+
+    xp     = config.get("server_tag_xp", 100)
+    new_xp = db_add_xp(guild_id, member.id, xp)
+    e = E("🏷️ Server Tag!", color=C_GOLD)
+    e.description = (
+        f"**{member.display_name}** is now sporting the server tag!\n"
+        f"Reward: **+{cur(config, xp)}**  |  Balance: **{cur(config, new_xp)}**"
+    )
+    e.set_thumbnail(url=member.display_avatar.url if member.display_avatar else None)
+    await notify_xp(bot, guild_id, embed=e)
+    await bot_log(bot, guild_id, "🏷️ Server Tag Reward",
+                  f"**Member:** {member.mention} ({member.display_name})\n"
+                  f"**Reward:** +{cur(config, xp)}\n"
+                  f"**Balance:** {cur(config, new_xp)}", C_GOLD)
+
+
 async def send_welcome_dm(member: discord.Member, config: dict, trigger: str = "join") -> bool:
     """Send the welcome DM to a member.  Returns True if the DM was sent successfully.
 
@@ -2365,27 +2420,21 @@ async def send_welcome_dm(member: discord.Member, config: dict, trigger: str = "
     dm_sent = False
     dm_error = ""
     try:
-        # For join trigger Discord needs extra time before the member is fully registered.
-        delay = 3 if trigger == "join" else 0.5
-        await asyncio.sleep(delay)
-        # Explicitly create the DM channel first — avoids 403 issues in some discord.py versions.
-        dm_channel = await member.create_dm()
-        await dm_channel.send(embed=e)
+        # Small delay; join needs 3 s for Discord to fully register the new member.
+        await asyncio.sleep(3 if trigger == "join" else 0.5)
+        await member.send(embed=e)
         dm_sent = True
     except discord.Forbidden as ex:
-        # Common reasons for 403:
-        #   code 50007 / 20026 — the member has "Allow direct messages from server members"
-        #     OFF in their Discord server privacy settings for THIS specific server.
-        #     (Different from global DM settings.)
-        #   code 50007 — the member has blocked the bot.
-        if ex.code in (50007, 20026):
-            dm_error = (
-                f"Forbidden (HTTP 403, code {ex.code}) — DMs are disabled.\n"
-                f"Fix: member must right-click the server → Privacy Settings → "
-                f"enable **Allow direct messages from server members**."
-            )
-        else:
-            dm_error = f"Forbidden (HTTP 403, code {ex.code}): {ex.text}"
+        # HTTP 403 / code 50007 or 20026:
+        #   The member has "Allow direct messages from server members" OFF in
+        #   Server Settings → Privacy for THIS server (separate from global DM settings),
+        #   OR they have the bot blocked.
+        # Fix: right-click server → Privacy Settings → enable Allow direct messages.
+        dm_error = (
+            f"Forbidden (HTTP 403, code {ex.code}) — DMs are disabled.\n"
+            f"Fix: member must right-click the server → Privacy Settings → "
+            f"enable **Allow direct messages from server members**."
+        )
     except discord.HTTPException as ex:
         dm_error = f"HTTPException (status {ex.status}, code {ex.code}): {ex.text}"
     except Exception as ex:
@@ -3118,18 +3167,39 @@ class ConfigDMsMenu(_SubMenu):
         if not members_to_dm:
             await i.followup.send(f"❌ No members found with <@&{bulk_role_id}>.", ephemeral=True)
             return
+        total = len(members_to_dm)
+        # Rate-limit constants:
+        #  • 2 s between each DM  → well within Discord's per-account anti-spam threshold
+        #  • 45 s pause every 25  → avoids the medium-term heuristic that flagged the bot
+        DM_DELAY_S      = 2.0   # seconds between every individual DM
+        BATCH_SIZE      = 25    # DMs per batch before a longer pause
+        BATCH_PAUSE_S   = 45    # seconds to wait between batches
+
+        eta_min = round((total * DM_DELAY_S + (total // BATCH_SIZE) * BATCH_PAUSE_S) / 60, 1)
         await i.followup.send(
-            f"📨 Sending welcome DM to **{len(members_to_dm)}** member(s) with <@&{bulk_role_id}>…",
+            f"📨 Sending welcome DM to **{total}** member(s) with <@&{bulk_role_id}>…\n"
+            f"⏱️ Estimated time: **~{eta_min} min** (rate-limited to avoid spam flags).",
             ephemeral=True)
         sent = 0
         failed = 0
-        for member in members_to_dm:
+        for idx, member in enumerate(members_to_dm, start=1):
             success = await send_welcome_dm(member, config, trigger="bulk")
             if success:
                 sent += 1
             else:
                 failed += 1
-            await asyncio.sleep(0.6)
+            # Every BATCH_SIZE DMs, take a longer break to avoid Discord's anti-spam heuristic
+            if idx % BATCH_SIZE == 0 and idx < total:
+                try:
+                    await i.followup.send(
+                        f"📨 Progress: **{sent}** sent, **{failed}** failed out of {idx}/{total}. "
+                        f"Pausing {BATCH_PAUSE_S}s to avoid rate-limit…",
+                        ephemeral=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(BATCH_PAUSE_S)
+            else:
+                await asyncio.sleep(DM_DELAY_S)
         await i.followup.send(
             f"✅ Done — **{sent}** DM(s) sent, **{failed}** failed.\n"
             + (f"⚠️ {failed} member(s) may have DMs disabled — check the log channel for details." if failed else ""),
@@ -3298,24 +3368,28 @@ class ConfigDailyQuestsMenu(_SubMenu):
 
 
 class ConfigBoostAnnounceMenu(_SubMenu):
-    """Configure boost announcements in the notification channel."""
+    """Configure boost announcements and server tag rewards."""
 
     def build_embed(self, config: dict) -> discord.Embed:
+        _on   = lambda v: "✅ Enabled"   if v else "❌ Disabled"
         _role = lambda rid: f"<@&{rid}>" if rid else "`Not set`"
-        e = E("🚀 Boost Announce Settings", color=C_ACHIEVE)
-        e.add_field(name="Announce Channel",
-                    value=f"<#{config['notification_channel_id']}>" if config.get("notification_channel_id") else "`Notifications channel`",
-                    inline=True)
-        e.add_field(name="Mention Role",
-                    value=_role(config.get("boost_announce_role_id")),
-                    inline=True)
-        e.add_field(name="Rate Limit",   value="**1 per hour** per guild", inline=True)
+        _ch   = lambda cid: f"<#{cid}>"  if cid else "`Not set`"
+        e = E("🚀 Boost Announce & 🏷️ Server Tag", color=C_ACHIEVE)
+        boost_ch = config.get("boost_announce_channel_id") or config.get("notification_channel_id")
+        e.add_field(name="📢 Announce Channel",
+                    value=f"<#{boost_ch}>" if boost_ch else "`Notifications channel`", inline=True)
+        e.add_field(name="📣 Mention Role",
+                    value=_role(config.get("boost_announce_role_id")), inline=True)
+        e.add_field(name="⏱️ Rate Limit", value="**1 per hour**", inline=True)
+        e.add_field(name="🏷️ Server Tag Reward",
+                    value=_on(config.get("server_tag_enabled", 0)), inline=True)
+        e.add_field(name="🏷️ Tag Reward Amount",
+                    value=f"**{cur(config, config.get('server_tag_xp', 100))}**", inline=True)
         e.add_field(name="\u200b", value=(
-            "When a member boosts the server, the bot posts a thank-you in the notifications channel "
-            "and mentions the Boost Announce Role to recruit more boosters.\n"
-            "Rate-limited to once per hour to avoid spam from multi-boosts.\n"
-            "Set the role to `empty` to announce without a role mention.\n"
-            "Uses the **Notifications** channel set in 💬 Channels."
+            "**Boost:** posts a thank-you when a member boosts. Rate-limited 1×/hour to avoid spam.\n"
+            "**Server Tag:** awards gems when a member enables the server's clan tag.\n"
+            "Members who already have the tag earn the reward when the bot restarts.\n"
+            "Requires discord.py 2.4+."
         ), inline=False)
         return e
 
@@ -3323,13 +3397,41 @@ class ConfigBoostAnnounceMenu(_SubMenu):
         raw = value.strip().lstrip("<@&").rstrip(">")
         return int(raw) if raw.isdigit() else None
 
-    @discord.ui.button(label="Boost Mention Role", style=discord.ButtonStyle.blurple, row=0)
+    def _parse_ch(self, value: str):
+        raw = value.strip().lstrip("<#").rstrip(">")
+        return int(raw) if raw.isdigit() else None
+
+    @discord.ui.button(label="📢 Announce Channel", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_boost_channel(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, boost_announce_channel_id=None)
+                await inter.response.send_message(
+                    "✅ Boost announce channel cleared — will use Notifications channel.", ephemeral=True)
+            else:
+                cid = self._parse_ch(value)
+                if not cid:
+                    await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+                db_set_config(self.guild.id, boost_announce_channel_id=cid)
+                await inter.response.send_message(
+                    f"✅ Boost announcements will go to <#{cid}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Boost Announce Channel",
+            label="Channel mention or ID (empty = use Notifications)",
+            placeholder="#boosts  or  1234567890",
+            default=str(config.get("boost_announce_channel_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="📣 Boost Mention Role", style=discord.ButtonStyle.blurple, row=0)
     async def btn_boost_role(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
         async def submit(inter, value):
             if not value.strip():
                 db_set_config(self.guild.id, boost_announce_role_id=None)
-                await inter.response.send_message("✅ Boost mention role removed — no role will be mentioned.", ephemeral=True)
+                await inter.response.send_message(
+                    "✅ Boost mention role removed — no role will be pinged.", ephemeral=True)
             else:
                 rid = self._parse_role(value)
                 if not rid:
@@ -3344,6 +3446,33 @@ class ConfigBoostAnnounceMenu(_SubMenu):
             placeholder="@Booster  or  1234567890",
             default=str(config.get("boost_announce_role_id") or ""),
             required=False, callback=submit))
+
+    @discord.ui.button(label="🏷️ Toggle Server Tag", style=discord.ButtonStyle.green, row=1)
+    async def btn_tag_toggle(self, interaction: discord.Interaction, btn):
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("server_tag_enabled", 0) else 1
+        db_set_config(self.guild.id, server_tag_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Server tag reward {'enabled' if new_val else 'disabled'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="🏷️ Tag Reward Amount", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_tag_xp(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                xp = int(value)
+                if xp < 0: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a non-negative number.", ephemeral=True); return
+            db_set_config(self.guild.id, server_tag_xp=xp)
+            cfg2 = db_get_config(self.guild.id)
+            await inter.response.send_message(
+                f"✅ Server tag reward set to **{cur(cfg2, xp)}**.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Server Tag Reward", "Gems awarded for enabling the server tag",
+            placeholder="100", default=str(config.get("server_tag_xp", 100)), callback=submit))
 
     @discord.ui.button(label="← Back", style=discord.ButtonStyle.grey, row=4)
     async def btn_back(self, interaction: discord.Interaction, btn):
@@ -5737,6 +5866,21 @@ async def on_ready():
             await asyncio.sleep(0.5)
     else:
         print("[WebSub] ⚠️  WEBHOOK_URL not set — push disabled, RSS fallback (5 min) active")
+    # Reward existing server tag holders on startup
+    for guild in bot.guilds:
+        cfg = db_get_config(guild.id)
+        if not cfg.get("server_tag_enabled", 0):
+            continue
+        try:
+            for member in guild.members:
+                if member.bot:
+                    continue
+                if member_has_server_tag(member):
+                    await _reward_server_tag(guild, member, cfg)
+                    await asyncio.sleep(0.1)
+        except Exception as _e:
+            print(f"[ServerTag] startup scan error for {guild.name}: {_e}")
+
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} slash command(s)")
@@ -5889,11 +6033,12 @@ async def on_member_remove(member: discord.Member):
 
 @bot.event
 async def on_guild_update(before: discord.Guild, after: discord.Guild):
-    """Award boost XP when premium_subscription_count rises (2nd+ boost from the same member)."""
+    """Award boost XP for ALL new boost slots (first or re-boost) based on the delta."""
     prev = before.premium_subscription_count or 0
     new  = after.premium_subscription_count or 0
     if new <= prev:
         return
+    delta     = new - prev          # Number of new boost slots applied at once
     guild_id  = after.id
     member_id = _pending_reboost.pop(guild_id, None)
     if not member_id:
@@ -5902,14 +6047,17 @@ async def on_guild_update(before: discord.Guild, after: discord.Guild):
     if not config.get("boost_quest_enabled", 1):
         return
     boost_xp = config.get("boost_quest_xp", 100)
-    new_xp   = db_add_xp(guild_id, member_id, boost_xp)
-    db_increment_stat(guild_id, member_id, "total_boosts")
+    total_xp = boost_xp * delta
+    new_xp   = db_add_xp(guild_id, member_id, total_xp)
+    for _ in range(delta):
+        db_increment_stat(guild_id, member_id, "total_boosts")
     member  = after.get_member(member_id)
     display = member.display_name if member else f"<@{member_id}>"
+    times_str = f" ({delta}× boosts)" if delta > 1 else ""
     e = E("🚀 Server Boost!", color=C_ACHIEVE)
     e.description = (
-        f"**{display}** boosted the server again!\n"
-        f"Reward: **+{cur(config, boost_xp)}**  |  Balance: **{cur(config, new_xp)}**"
+        f"**{display}** boosted the server{times_str}!\n"
+        f"Reward: **+{cur(config, total_xp)}**  |  Balance: **{cur(config, new_xp)}**"
     )
     await notify_xp(bot, guild_id, embed=e)
     month_key = current_month_key()
@@ -5918,40 +6066,24 @@ async def on_guild_update(before: discord.Guild, after: discord.Guild):
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    """Track server boosts and role-based welcome DM."""
+    """Track server boosts, server tag rewards, and role-based welcome DM."""
     guild_id = after.guild.id
     config = db_get_config(guild_id)
 
-    # ── Detect new boost ────────────────────────────────────────
+    # ── Detect boost (first or re-boost) ───────────────────────
+    # Always store the member in _pending_reboost so on_guild_update can
+    # award XP for the exact number of boost slots applied (delta).
     if not before.premium_since and after.premium_since:
-        # First boost from this member
-        boost_xp = config.get("boost_quest_xp", 100)
-        if config.get("boost_quest_enabled", 1):
-            new_xp = db_add_xp(guild_id, after.id, boost_xp)
-            db_increment_stat(guild_id, after.id, "total_boosts")
-            e = E("🚀 Server Boost!", color=C_ACHIEVE)
-            e.description = (
-                f"**{after.display_name}** boosted the server!\n"
-                f"Reward: **+{cur(config, boost_xp)}**  |  Balance: **{cur(config, new_xp)}**"
-            )
-            await notify_xp(bot, guild_id, embed=e)
-            month_key = current_month_key()
-            db_assign_monthly_quests(guild_id, after.id, month_key)
-            await check_achievements(bot, guild_id, after.id)
-    elif before.premium_since and after.premium_since:
-        # Member already had premium_since set — may be adding a 2nd boost.
-        # Store their id; on_guild_update will confirm if the guild count rose.
+        # First boost → queue for on_guild_update
         _pending_reboost[guild_id] = after.id
-
-    # ── Boost announcement (rate-limited to once/hour per guild) ────────────
-    if not before.premium_since and after.premium_since:
+        # Boost announcement (rate-limited to once/hour per guild)
         announce_role_id = config.get("boost_announce_role_id")
-        notify_ch_id     = config.get("notification_channel_id")
+        announce_ch_id   = config.get("boost_announce_channel_id") or config.get("notification_channel_id")
         import time as _time
-        now_ts = _time.time()
+        now_ts  = _time.time()
         last_ts = _boost_announce_ts.get(guild_id, 0.0)
-        if notify_ch_id and (now_ts - last_ts) >= 3600:
-            ch = bot.get_channel(notify_ch_id)
+        if announce_ch_id and (now_ts - last_ts) >= 3600:
+            ch = bot.get_channel(announce_ch_id)
             if ch:
                 role_ping = f"<@&{announce_role_id}> — " if announce_role_id else ""
                 try:
@@ -5962,6 +6094,16 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     _boost_announce_ts[guild_id] = now_ts
                 except Exception:
                     pass
+    elif before.premium_since and after.premium_since:
+        # Re-boost (adding another slot) → queue for on_guild_update
+        _pending_reboost[guild_id] = after.id
+
+    # ── Server tag reward ───────────────────────────────────────
+    if config.get("server_tag_enabled", 0):
+        before_tag = getattr(before, "guild_tag", None)
+        after_tag  = getattr(after,  "guild_tag", None)
+        if after_tag and not before_tag:
+            await _reward_server_tag(after.guild, after, config)
 
     # ── Role-based welcome DM ───────────────────────────────────
     # Fires whenever welcome_dm_on_role_id is configured — independent of welcome_dm_enabled.
@@ -6133,11 +6275,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                   f"**Amount:** +{cur(config_r, xp_to_give)}{mult_str}\n"
                   f"**Balance:** {cur(config_r, new_xp)}"
                   + (f"\n**Streak:** 🔥{streak_updated}" if streak_updated else ""), C_SUCCESS)
-    # Daily quest: actor gets credit for awarding a reaction bonus
+    # Daily quest: the RECIPIENT gets credit for "Get a reaction bonus from a Meeple Owner"
     if config_r.get("daily_quest_enabled", 0):
         dq_date = db_today_key()
-        dq_done = db_daily_quest_progress(payload.guild_id, actor.id, dq_date, "dq_react")
-        await process_daily_quest_completions(bot, payload.guild_id, actor.id, dq_done, dq_date)
+        dq_done = db_daily_quest_progress(payload.guild_id, target.id, dq_date, "dq_get_react")
+        await process_daily_quest_completions(bot, payload.guild_id, target.id, dq_done, dq_date)
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
@@ -6187,6 +6329,13 @@ async def on_message(message: discord.Message):
     share_ch_id = config.get("share_channel_id")
     if share_ch_id and message.channel.id == share_ch_id:
         await _handle_share(message, config)
+    # Daily quest: count messages in the configured chat channel
+    dq_msgs_ch = config.get("daily_quest_messages_channel_id")
+    if dq_msgs_ch and message.channel.id == dq_msgs_ch and config.get("daily_quest_enabled", 0):
+        dq_date = db_today_key()
+        dq_done = db_daily_quest_progress(message.guild.id, message.author.id, dq_date, "dq_messages")
+        if dq_done:
+            await process_daily_quest_completions(bot, message.guild.id, message.author.id, dq_done, dq_date)
     await bot.process_commands(message)
 
 async def _handle_share(message: discord.Message, config: dict):
@@ -6197,8 +6346,13 @@ async def _handle_share(message: discord.Message, config: dict):
     window_min = config.get("share_window_min") or 20
     c_name     = config.get("currency_name") or "Gems"
 
+    # Meeple Owners can post freely — never delete or DM them.
+    is_manager = isinstance(message.author, discord.Member) and is_xp_manager(message.author, config)
+
     async def _reject(dm_text: str):
-        """DM the author and delete the message."""
+        """DM the author and delete the message — skip silently for Meeple Owners."""
+        if is_manager:
+            return
         try:
             await message.author.send(dm_text)
         except Exception:
