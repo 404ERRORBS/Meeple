@@ -1,6 +1,6 @@
-# Meeple Bot — Deployment Guide (v2.8)
+# Meeple Bot — Deployment Guide (v2.9)
 
-A Discord bot that manages a fully configurable economy for your server: video sharing, reaction rewards, streaks, a shop, quests, achievements, daily quests, and boost announcements. The currency name and emoji are customizable per server via `/config`.
+A Discord bot that manages a fully configurable economy for your server: video sharing, reaction rewards, streaks, a shop, quests, achievements, daily quests, boost announcements, and a daily revive-ping button. The currency name and emoji are customizable per server via `/config`.
 
 ---
 
@@ -14,7 +14,7 @@ A Discord bot that manages a fully configurable economy for your server: video s
 ### Files in this folder
 | File | Purpose |
 |---|---|
-| `main.py` | Full bot source (v2.8 — all fixes) |
+| `main.py` | Full bot source (v2.9 — all fixes + new features) |
 | `requirements.txt` | Python dependencies |
 | `Procfile` | Render web service definition |
 | `.gitignore` | Ignores `bot_data.db` and `.env` |
@@ -87,15 +87,38 @@ The snooze duration is configurable in **minutes, hours, or days** (e.g. `30m`, 
 | **Purchase DM** | DMs a role when a member opens a purchase ticket |
 | **📨 Send DMs** | Sends the welcome DM to all members with the Bulk DM Role |
 
-#### Fixing DM Failures (HTTP 403 / code 20026 or 50007)
-If the log channel shows DM failures, the member has **Allow direct messages from server members** disabled.
+### 6. Daily Quests (`🗓️ Daily Quests`)
 
-Ask the member to:
-1. Right-click the server name in Discord
-2. Go to **Privacy Settings**
-3. Enable **Allow direct messages from server members**
+| Setting | Purpose |
+|---|---|
+| Toggle Daily Quests | Enable / disable the daily quest system |
+| Quest Role | Restrict quests to members with a specific role |
+| Toggle DMs | Send quest list via DM at UTC midnight |
+| Reward XP | Currency awarded per completed quest |
+| **💬 Chat Channel** | Channel counted for the "send N messages" quest — shows as a clickable #channel in the quest |
+| **👑 Gems Bonus Owner** | The @member shown in the "get a gems bonus" quest — set to your own Discord user ID so members can ping you directly |
 
-> This is a **per-server** setting, not a global DM setting. The bot now correctly opens the DM channel before sending to avoid spurious 403 errors.
+> **Gems Bonus Owner:** By default shows `404ERROR`. Set it to your Discord user ID so the quest shows your clickable @mention and the instructions say "ping them to ask!".
+
+### 7. Boost Announce (`🚀 Boost Announce`)
+Configure the channel and role mentioned when a member boosts the server.
+- **Bug fix v2.9:** simultaneous boosts from multiple members are now all detected and rewarded correctly.
+- **Bug fix v2.9:** channel configuration now saves reliably (interaction timeout fixed).
+
+### 8. Revive Ping (`🔔 Revive Ping`) — New in v2.9
+
+| Setting | Purpose |
+|---|---|
+| Toggle Revive Ping | Enable / disable the daily button |
+| 🔔 Set Ping Role | The role given when members click the button |
+| ➕ Add Channel | Add a channel to the daily pool |
+| ➖ Remove Channel | Remove a channel from the pool |
+
+**How it works:**
+- Once per day at **12:00 UTC**, the bot posts a button in **one random channel** from your configured pool.
+- Members click **🔔 Toggle Revive Ping role** to opt in or out.
+- Clicking again removes the role (toggle behaviour).
+- The goal is to maintain a pool of members to ping when the chat goes quiet.
 
 ---
 
@@ -109,7 +132,7 @@ Ask the member to:
 | `/topstreak` | ⭐ Top streak leaderboard |
 | `/shop` | Browse and buy items |
 | `/inventory` | View your purchased items |
-| `/quests` | Monthly quests |
+| `/quests` | Monthly + daily quests |
 | `/achievements` | Your achievement progress |
 | `/video` | See the current video to share |
 | `/info` | How the rewards system works |
@@ -144,36 +167,33 @@ Enable these in the [Discord Developer Portal](https://discord.com/developers/ap
 
 ## Changelog
 
-### v2.8 — DM fix · Notification prompt · UI reorganisation
+### v2.9 — Daily quest improvements · Boost fix · Revive Ping
+
+**New Features**
+
+1. **Daily Quest: "send messages" now shows a clickable #channel**
+   - Configure the target channel in `/config → 🗓️ Daily Quests → 💬 Chat Channel`.
+   - The quest displays `<#channel>` as a clickable Discord link.
+
+2. **Daily Quest: "gems bonus" shows a configurable owner @mention**
+   - Renamed from "reaction bonus from Meeple Owner" → "gems bonus from @owner (ping them to ask!)".
+   - Set your Discord user ID in `/config → 🗓️ Daily Quests → 👑 Gems Bonus Owner`.
+   - The @mention is clickable. Default shows `404ERROR` when not configured.
+
+3. **🔔 Revive Ping — new feature**
+   - Once per day at 12:00 UTC, the bot posts a toggle button in a random channel from your pool.
+   - Members click to opt in/out of the @revive-ping role.
+   - Fully configurable: role, channels pool, and toggle in `/config → 🔔 Revive Ping`.
 
 **Bug Fixes**
 
-1. **Welcome DM — all triggers (join, role, bulk)**
-   - Now calls `create_dm()` explicitly before `send()`, which fixes persistent 403 failures even when DMs appear enabled.
-   - Join-trigger delay increased to 3 s (was 0.5 s) so Discord fully registers new accounts before the DM is attempted.
-   - Error message now distinguishes codes 50007 and 20026 with clearer fix instructions.
+4. **Boost announce channel config — "interaction failed" fixed**
+   - The `_refresh` method now falls back to direct message editing when the interaction token is a modal token, preventing the "This interaction failed" error.
 
-2. **Notification prompt — only showed once**
-   - The prompt now sets a debounce snooze equal to the configured cooldown after being shown, so it does not flood users on every command.
-   - Failed followup sends now correctly undo the debounce snooze so the next command can retry.
-   - Error logging improved: failure code is printed to stdout.
+5. **Boost detection — simultaneous boosters now all rewarded**
+   - Changed internal tracking from a single member ID per guild to a list, so two members boosting at the same moment both receive their XP.
 
-3. **Notification prompt — cooldown `0` ("always show")**
-   - A debounce of 1 minute is applied even when cooldown is set to `0` to prevent rapid re-sends.
-
-**UI Reorganisation**
-
-4. **`📨 Send DMs` moved from `/admin` → `/config → 📨 DMs & Welcome`**
-   - Logically grouped with the other DM settings.
-
-5. **`🛒 Manage Shop` removed from `/admin`**
-   - Shop management already exists in `/config → 🛒 Shop`.
-
-6. **`📊 Status` removed from `/config` main menu**
-   - Redundant with the config overview embed that opens automatically.
-
-7. **`📨 DMs & Welcome` moved to row 1 in `/config`** (was row 2) for better discoverability.
-
+### v2.8 — DM fix · Notification prompt · UI reorganisation
 ### v2.7 — Bug fixes: DMs · Boost Announce · Notification Prompt
 ### v2.6 — Bug fixes · Daily Quests · Boost Announce · /streak · /topstreak · Admin tools
 ### v2.5 — Customisable announce message · Info embed channels · DM fixes · Bulk DMs · Full logs

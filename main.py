@@ -129,8 +129,8 @@ DAILY_QUEST_POOL = [
     {"key": "dq_check_gems", "name": "Check your balance with /gems",        "type": "dq_checkin",  "target": 1},
     {"key": "dq_check_q",    "name": "View your quests with /quests",        "type": "dq_checkq",   "target": 1},
     {"key": "dq_share_top10","name": "Share and be in the top 10",           "type": "dq_top10",    "target": 1},
-    {"key": "dq_get_react",  "name": "Get a reaction bonus from a Meeple Owner", "type": "dq_get_react", "target": 1},
-    # dq_messages: target is randomised (10–50) at assignment time — name updated accordingly
+    {"key": "dq_get_react",  "name": "Get a gems bonus from 404ERROR (ping them to ask!)", "type": "dq_get_react", "target": 1},
+    # dq_messages: target and channel are resolved at assignment time
     {"key": "dq_messages",   "name": "Send {n} messages in the chat",        "type": "dq_messages", "target": 20},
 ]
 
@@ -449,6 +449,12 @@ def init_db():
         "ALTER TABLE guild_config ADD COLUMN daily_quest_role_id INTEGER",
         "ALTER TABLE guild_config ADD COLUMN daily_quest_dm_enabled INTEGER DEFAULT 1",
         "ALTER TABLE guild_config ADD COLUMN daily_quest_xp INTEGER DEFAULT 50",
+        # Gems bonus quest: configurable owner user ID
+        "ALTER TABLE guild_config ADD COLUMN meeple_owner_user_id INTEGER",
+        # Revive ping: role to assign + list of channels (JSON array) + toggle
+        "ALTER TABLE guild_config ADD COLUMN revive_ping_role_id INTEGER",
+        "ALTER TABLE guild_config ADD COLUMN revive_ping_channels TEXT DEFAULT '[]'",
+        "ALTER TABLE guild_config ADD COLUMN revive_ping_enabled INTEGER DEFAULT 0",
     ]:
         try:
             conn.execute(migration)
@@ -465,6 +471,14 @@ def init_db():
         user_id  INTEGER,
         rewarded_at TEXT DEFAULT (datetime('now')),
         PRIMARY KEY (guild_id, user_id)
+    )""")
+
+    # Tracks which channel received the revive-ping button today (one per guild per day)
+    conn.execute("""CREATE TABLE IF NOT EXISTS revive_ping_sent (
+        guild_id   INTEGER,
+        date_key   TEXT,
+        channel_id INTEGER,
+        PRIMARY KEY (guild_id, date_key)
     )""")
 
     # Fix daily_quests PRIMARY KEY — original schema only had (guild_id, user_id, date_key),
@@ -913,10 +927,19 @@ def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: in
     for q in chosen:
         target = q["target"]
         name   = q["name"]
-        # dq_messages: randomise target between 10 and 50 each day
+        # dq_messages: randomise target and embed the configured chat channel as a clickable mention
         if q["type"] == "dq_messages":
-            target = _random.randint(10, 50)
-            name   = f"Send {target} messages in the chat"
+            target     = _random.randint(10, 50)
+            dq_cfg     = db_get_config(guild_id)
+            msgs_ch_id = dq_cfg.get("daily_quest_messages_channel_id")
+            ch_str     = f"<#{msgs_ch_id}>" if msgs_ch_id else "the chat"
+            name       = f"Send {target} messages in {ch_str}"
+        # dq_get_react: show the configurable owner mention
+        elif q["type"] == "dq_get_react":
+            dq_cfg    = db_get_config(guild_id)
+            owner_uid = dq_cfg.get("meeple_owner_user_id")
+            owner_str = f"<@{owner_uid}>" if owner_uid else "**404ERROR** *(set an owner in /config → Daily Quests)*"
+            name      = f"Get a gems bonus from {owner_str} (ping them to ask!)"
         conn.execute(
             "INSERT OR IGNORE INTO daily_quests "
             "(guild_id, user_id, date_key, quest_key, quest_type, quest_target, quest_name) "
@@ -2531,6 +2554,11 @@ class ConfigMainMenu(discord.ui.View):
         sub = ConfigBoostAnnounceMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
+    @discord.ui.button(label="🔔 Revive Ping", style=discord.ButtonStyle.blurple, row=2)
+    async def cat_revive_ping(self, i, b):
+        sub = ConfigRevivePingMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
     @discord.ui.button(label="📖 Tutorial", style=discord.ButtonStyle.green, row=3)
     async def cat_tutorial(self, i: discord.Interaction, b):
         config  = db_get_config(self.guild.id)
@@ -2611,7 +2639,18 @@ class _SubMenu(discord.ui.View):
 
     async def _refresh(self, interaction: discord.Interaction):
         config = db_get_config(self.guild.id)
-        await interaction.edit_original_response(embed=self.build_embed(config), view=self)
+        embed  = self.build_embed(config)
+        # Try editing via the interaction webhook first; fall back to direct
+        # message edit (needed when the interaction responded with a modal,
+        # where edit_original_response returns 404 on the modal token).
+        try:
+            await interaction.edit_original_response(embed=embed, view=self)
+        except Exception:
+            try:
+                if getattr(interaction, "message", None):
+                    await interaction.message.edit(embed=embed, view=self)
+            except Exception:
+                pass
 
     @discord.ui.button(label="← Back", style=discord.ButtonStyle.grey, row=4)
     async def btn_back(self, interaction: discord.Interaction, btn: discord.ui.Button):
@@ -3288,16 +3327,21 @@ class ConfigDailyQuestsMenu(_SubMenu):
     def build_embed(self, config: dict) -> discord.Embed:
         _on   = lambda v: "✅ Enabled" if v else "❌ Disabled"
         _role = lambda rid: f"<@&{rid}>" if rid else "`Not set`"
+        _ch   = lambda cid: f"<#{cid}>"  if cid else "`Not set`"
+        _user = lambda uid: f"<@{uid}>"  if uid else "`Not set (default: 404ERROR)`"
         e = E("🗓️ Daily Quests Settings", color=C_MAIN)
-        e.add_field(name="Daily Quests",       value=_on(config.get("daily_quest_enabled", 0)),     inline=True)
-        e.add_field(name="Quest Role",         value=_role(config.get("daily_quest_role_id")),       inline=True)
-        e.add_field(name="DM Enabled",         value=_on(config.get("daily_quest_dm_enabled", 1)),  inline=True)
+        e.add_field(name="Daily Quests",        value=_on(config.get("daily_quest_enabled", 0)),     inline=True)
+        e.add_field(name="Quest Role",          value=_role(config.get("daily_quest_role_id")),       inline=True)
+        e.add_field(name="DM Enabled",          value=_on(config.get("daily_quest_dm_enabled", 1)),  inline=True)
         xp = config.get("daily_quest_xp", 50)
-        e.add_field(name="Reward per Quest",   value=f"**{xp}** {config.get('currency_emoji','💎')}", inline=True)
+        e.add_field(name="Reward per Quest",    value=f"**{xp}** {config.get('currency_emoji','💎')}", inline=True)
+        e.add_field(name="💬 Chat Channel",     value=_ch(config.get("daily_quest_messages_channel_id")), inline=True)
+        e.add_field(name="👑 Gems Bonus Owner", value=_user(config.get("meeple_owner_user_id")),     inline=True)
         e.add_field(name="\u200b", value=(
             "Members with the Quest Role receive 3 random daily quests each day.\n"
             "If DM Enabled, they receive a DM at UTC midnight with their quests.\n"
-            "Quests reset daily. 0 = disabled. Set Role to restrict to a role."
+            "**Chat Channel** — channel counted for the 'send messages' quest (shown as clickable #channel).\n"
+            "**Gems Bonus Owner** — the @member mentioned in the 'get a gems bonus' quest."
         ), inline=False)
         return e
 
@@ -3362,9 +3406,57 @@ class ConfigDailyQuestsMenu(_SubMenu):
             default=str(config.get("daily_quest_xp", 50)),
             callback=submit))
 
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.grey, row=4)
-    async def btn_back(self, interaction: discord.Interaction, btn):
-        await self._back(interaction)
+    @discord.ui.button(label="💬 Chat Channel", style=discord.ButtonStyle.blurple, row=2)
+    async def btn_chat_ch(self, interaction: discord.Interaction, btn):
+        """Set the channel that counts for the 'send messages' daily quest."""
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, daily_quest_messages_channel_id=None)
+                await inter.response.send_message("✅ Chat channel removed.", ephemeral=True)
+            else:
+                ch_id = parse_channel_id(value)
+                if not ch_id:
+                    await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+                db_set_config(self.guild.id, daily_quest_messages_channel_id=ch_id)
+                await inter.response.send_message(
+                    f"✅ Chat channel set to <#{ch_id}>.\n"
+                    "New 'send messages' quests will show this channel as a clickable link.",
+                    ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Daily Quest Chat Channel",
+            label="Channel mention or ID (empty = remove)",
+            placeholder="#global  or  1234567890",
+            default=str(config.get("daily_quest_messages_channel_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="👑 Gems Bonus Owner", style=discord.ButtonStyle.blurple, row=2)
+    async def btn_owner_uid(self, interaction: discord.Interaction, btn):
+        """Set the Discord user mentioned in the 'get a gems bonus' daily quest."""
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, meeple_owner_user_id=None)
+                await inter.response.send_message(
+                    "✅ Owner removed — quest will show '404ERROR' by default.", ephemeral=True)
+            else:
+                raw = value.strip().lstrip("<@!").rstrip(">")
+                if not raw.isdigit():
+                    await inter.response.send_message(
+                        "❌ Mention the user or paste their ID.", ephemeral=True); return
+                db_set_config(self.guild.id, meeple_owner_user_id=int(raw))
+                await inter.response.send_message(
+                    f"✅ Gems bonus owner set to <@{raw}>.\n"
+                    "The 'get a gems bonus' quest will show their @mention (clickable).",
+                    ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Gems Bonus Owner",
+            label="User mention or ID (empty = default 404ERROR)",
+            placeholder="@404ERROR  or  1234567890",
+            default=str(config.get("meeple_owner_user_id") or ""),
+            required=False, callback=submit))
 
 
 class ConfigBoostAnnounceMenu(_SubMenu):
@@ -3474,9 +3566,175 @@ class ConfigBoostAnnounceMenu(_SubMenu):
             "Server Tag Reward", "Gems awarded for enabling the server tag",
             placeholder="100", default=str(config.get("server_tag_xp", 100)), callback=submit))
 
-    @discord.ui.button(label="← Back", style=discord.ButtonStyle.grey, row=4)
-    async def btn_back(self, interaction: discord.Interaction, btn):
-        await self._back(interaction)
+    # ← Back is inherited from _SubMenu — no duplicate needed
+
+
+# ══════════════════════════════════════════════════════════════
+#  REVIVE PING CONFIG SUBMENU
+# ══════════════════════════════════════════════════════════════
+
+class ConfigRevivePingMenu(_SubMenu):
+    """Configure the daily revive-ping button that appears in selected channels."""
+
+    def build_embed(self, config: dict) -> discord.Embed:
+        _on   = lambda v: "✅ Enabled" if v else "❌ Disabled"
+        _role = lambda rid: f"<@&{rid}>" if rid else "`Not set`"
+        channels_raw = config.get("revive_ping_channels") or "[]"
+        try:
+            ch_ids = json.loads(channels_raw)
+        except Exception:
+            ch_ids = []
+        ch_list = ", ".join(f"<#{c}>" for c in ch_ids) if ch_ids else "`None configured`"
+        e = discord.Embed(title="🔔 Revive Ping Settings", color=0x3498DB)
+        e.add_field(name="Enabled",       value=_on(config.get("revive_ping_enabled", 0)), inline=True)
+        e.add_field(name="Ping Role",     value=_role(config.get("revive_ping_role_id")),   inline=True)
+        e.add_field(name="Channels",      value=ch_list,                                    inline=False)
+        e.add_field(name="\u200b", value=(
+            "Once per day the bot posts a button **in one random configured channel** that lets\n"
+            "members opt in/out of the **Revive Ping** role (to avoid dead chat).\n\n"
+            "• **Ping Role** — the role assigned when the button is clicked\n"
+            "• **Channels** — pool of channels from which one is picked each day\n"
+            "• Add/remove channels one at a time with the buttons below."
+        ), inline=False)
+        return e
+
+    def _parse_role(self, value: str):
+        raw = value.strip().lstrip("<@&").rstrip(">")
+        return int(raw) if raw.isdigit() else None
+
+    def _get_channels(self, config: dict) -> list:
+        try:
+            return json.loads(config.get("revive_ping_channels") or "[]")
+        except Exception:
+            return []
+
+    @discord.ui.button(label="Toggle Revive Ping", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_toggle(self, interaction: discord.Interaction, btn):
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("revive_ping_enabled", 0) else 1
+        db_set_config(self.guild.id, revive_ping_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Revive ping {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="🔔 Set Ping Role", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_role(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, revive_ping_role_id=None)
+                await inter.response.send_message("✅ Revive ping role removed.", ephemeral=True)
+            else:
+                rid = self._parse_role(value)
+                if not rid:
+                    await inter.response.send_message("❌ Invalid role.", ephemeral=True); return
+                db_set_config(self.guild.id, revive_ping_role_id=rid)
+                await inter.response.send_message(
+                    f"✅ Revive ping role set to <@&{rid}>.\n"
+                    "Members will receive/lose this role when clicking the daily button.",
+                    ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Revive Ping Role",
+            label="Role mention or ID (empty = remove)",
+            placeholder="@revive-ping  or  1234567890",
+            default=str(config.get("revive_ping_role_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="➕ Add Channel", style=discord.ButtonStyle.green, row=1)
+    async def btn_add_ch(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            ch_id = parse_channel_id(value)
+            if not ch_id:
+                await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+            ch_ids = self._get_channels(config)
+            if ch_id in ch_ids:
+                await inter.response.send_message("⚠️ That channel is already in the list.", ephemeral=True); return
+            ch_ids.append(ch_id)
+            db_set_config(self.guild.id, revive_ping_channels=json.dumps(ch_ids))
+            await inter.response.send_message(f"✅ <#{ch_id}> added to revive ping channels.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Add Revive Ping Channel",
+            label="Channel mention or ID",
+            placeholder="#general  or  1234567890",
+            callback=submit))
+
+    @discord.ui.button(label="➖ Remove Channel", style=discord.ButtonStyle.red, row=1)
+    async def btn_remove_ch(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            ch_id = parse_channel_id(value)
+            if not ch_id:
+                await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+            ch_ids = self._get_channels(config)
+            if ch_id not in ch_ids:
+                await inter.response.send_message("⚠️ That channel is not in the list.", ephemeral=True); return
+            ch_ids.remove(ch_id)
+            db_set_config(self.guild.id, revive_ping_channels=json.dumps(ch_ids))
+            await inter.response.send_message(f"✅ <#{ch_id}> removed from revive ping channels.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Remove Revive Ping Channel",
+            label="Channel mention or ID to remove",
+            placeholder="#general  or  1234567890",
+            callback=submit))
+
+    # ← Back is inherited from _SubMenu
+
+
+# ══════════════════════════════════════════════════════════════
+#  REVIVE PING BUTTON VIEW (posted daily in channels)
+# ══════════════════════════════════════════════════════════════
+
+class RevivePingView(discord.ui.View):
+    """Persistent view posted once per day in a random configured channel.
+    Clicking toggles the revive-ping role on/off for the member."""
+
+    def __init__(self, guild_id: int, role_id: int):
+        super().__init__(timeout=None)  # Persistent — survives bot restarts
+        self.guild_id = guild_id
+        self.role_id  = role_id
+
+    @discord.ui.button(label="🔔 Toggle Revive Ping role", style=discord.ButtonStyle.green,
+                       custom_id="revive_ping_toggle")
+    async def btn_toggle(self, interaction: discord.Interaction, btn):
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Server only.", ephemeral=True)
+            return
+        config = db_get_config(interaction.guild.id)
+        role_id = config.get("revive_ping_role_id")
+        if not role_id:
+            await interaction.response.send_message(
+                "❌ Revive ping role is not configured. Ask an admin to set it in `/config → 🔔 Revive Ping`.",
+                ephemeral=True)
+            return
+        role = interaction.guild.get_role(role_id)
+        if not role:
+            await interaction.response.send_message(
+                "❌ The revive ping role no longer exists. Ask an admin to reconfigure it.",
+                ephemeral=True)
+            return
+        member = interaction.user
+        if role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Revive ping opt-out via button")
+                await interaction.response.send_message(
+                    f"🔕 You have been **removed** from {role.mention} and will no longer receive revive pings.",
+                    ephemeral=True)
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "❌ I don't have permission to remove that role. Ask an admin.", ephemeral=True)
+        else:
+            try:
+                await member.add_roles(role, reason="Revive ping opt-in via button")
+                await interaction.response.send_message(
+                    f"🔔 You have been **added** to {role.mention}! You'll get pinged when the chat needs a boost.",
+                    ephemeral=True)
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "❌ I don't have permission to assign that role. Ask an admin.", ephemeral=True)
 
 
 class ConfigXPMenu(_SubMenu):
@@ -5559,7 +5817,7 @@ intents.guilds           = True
 
 # Tracks members who fire on_member_update with premium_since already set,
 # so on_guild_update can attribute a 2nd+ server boost to the right member.
-_pending_reboost:    dict[int, int]   = {}  # guild_id -> member_id
+_pending_reboost:    dict[int, list]  = {}  # guild_id -> [member_id, ...]  (list supports simultaneous boosters)
 _boost_announce_ts:  dict[int, float] = {}  # guild_id -> last announce unix timestamp
 
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -5824,6 +6082,79 @@ async def before_daily_quests():
     next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     await asyncio.sleep((next_midnight - now).total_seconds())
 
+
+@tasks.loop(hours=24)
+async def send_revive_ping_button():
+    """Once per day, post a revive-ping opt-in button in ONE random configured channel per guild."""
+    await bot.wait_until_ready()
+    date_key = db_today_key()
+    conn = get_db()
+    guilds = conn.execute(
+        "SELECT guild_id, revive_ping_role_id, revive_ping_channels "
+        "FROM guild_config WHERE revive_ping_enabled=1 AND revive_ping_role_id IS NOT NULL"
+    ).fetchall()
+    conn.close()
+
+    for row in guilds:
+        guild_id  = row["guild_id"]
+        role_id   = row["revive_ping_role_id"]
+        try:
+            ch_ids = json.loads(row["revive_ping_channels"] or "[]")
+        except Exception:
+            ch_ids = []
+        if not ch_ids:
+            continue
+
+        # Skip if already sent today
+        conn2 = get_db()
+        already = conn2.execute(
+            "SELECT 1 FROM revive_ping_sent WHERE guild_id=? AND date_key=?",
+            (guild_id, date_key)
+        ).fetchone()
+        conn2.close()
+        if already:
+            continue
+
+        # Pick a random channel from the configured pool
+        _random.shuffle(ch_ids)
+        sent = False
+        for ch_id in ch_ids:
+            ch = bot.get_channel(ch_id)
+            if not ch:
+                continue
+            try:
+                view = RevivePingView(guild_id, role_id)
+                role = ch.guild.get_role(role_id)
+                role_mention = role.mention if role else "@revive-ping"
+                await ch.send(
+                    f"🔔 **Want to help keep the chat alive?**\n"
+                    f"Click below to toggle the {role_mention} role.\n"
+                    f"You'll get pinged when the chat needs a boost — and you can remove it any time!",
+                    view=view
+                )
+                conn3 = get_db()
+                conn3.execute(
+                    "INSERT OR REPLACE INTO revive_ping_sent (guild_id, date_key, channel_id) VALUES (?,?,?)",
+                    (guild_id, date_key, ch_id)
+                )
+                conn3.commit()
+                conn3.close()
+                sent = True
+                break
+            except Exception:
+                continue
+
+@send_revive_ping_button.before_loop
+async def before_revive_ping():
+    """Wait until a fixed time each day (12:00 UTC) to post the revive ping button."""
+    await bot.wait_until_ready()
+    now = datetime.utcnow()
+    target = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    await asyncio.sleep((target - now).total_seconds())
+
+
 # ══════════════════════════════════════════════════════════════
 #  EVENTS
 # ══════════════════════════════════════════════════════════════
@@ -5844,7 +6175,7 @@ async def on_ready():
             pass
     for loop in [check_youtube, auto_backup, check_expired_items, check_community_goals,
                  check_streak_reminders, check_share_channel_lock, renew_websub_subscriptions,
-                 check_daily_quests]:
+                 check_daily_quests, send_revive_ping_button]:
         if not loop.is_running():
             loop.start()
     # Initial WebSub subscription for all configured channels
@@ -6038,31 +6369,30 @@ async def on_guild_update(before: discord.Guild, after: discord.Guild):
     new  = after.premium_subscription_count or 0
     if new <= prev:
         return
-    delta     = new - prev          # Number of new boost slots applied at once
-    guild_id  = after.id
-    member_id = _pending_reboost.pop(guild_id, None)
-    if not member_id:
+    delta        = new - prev          # Number of new boost slots applied at once
+    guild_id     = after.id
+    members_list = _pending_reboost.pop(guild_id, [])
+    if not members_list:
         return
     config = db_get_config(guild_id)
     if not config.get("boost_quest_enabled", 1):
         return
     boost_xp = config.get("boost_quest_xp", 100)
-    total_xp = boost_xp * delta
-    new_xp   = db_add_xp(guild_id, member_id, total_xp)
-    for _ in range(delta):
+    # Award each queued booster for one slot (covers simultaneous boosts correctly)
+    for member_id in members_list:
+        new_xp = db_add_xp(guild_id, member_id, boost_xp)
         db_increment_stat(guild_id, member_id, "total_boosts")
-    member  = after.get_member(member_id)
-    display = member.display_name if member else f"<@{member_id}>"
-    times_str = f" ({delta}× boosts)" if delta > 1 else ""
-    e = E("🚀 Server Boost!", color=C_ACHIEVE)
-    e.description = (
-        f"**{display}** boosted the server{times_str}!\n"
-        f"Reward: **+{cur(config, total_xp)}**  |  Balance: **{cur(config, new_xp)}**"
-    )
-    await notify_xp(bot, guild_id, embed=e)
-    month_key = current_month_key()
-    db_assign_monthly_quests(guild_id, member_id, month_key)
-    await check_achievements(bot, guild_id, member_id)
+        member  = after.get_member(member_id)
+        display = member.display_name if member else f"<@{member_id}>"
+        e = E("🚀 Server Boost!", color=C_ACHIEVE)
+        e.description = (
+            f"**{display}** boosted the server!\n"
+            f"Reward: **+{cur(config, boost_xp)}**  |  Balance: **{cur(config, new_xp)}**"
+        )
+        await notify_xp(bot, guild_id, embed=e)
+        month_key = current_month_key()
+        db_assign_monthly_quests(guild_id, member_id, month_key)
+        await check_achievements(bot, guild_id, member_id)
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -6075,7 +6405,11 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     # award XP for the exact number of boost slots applied (delta).
     if not before.premium_since and after.premium_since:
         # First boost → queue for on_guild_update
-        _pending_reboost[guild_id] = after.id
+        # Use a list so multiple simultaneous boosters are all tracked
+        if guild_id not in _pending_reboost:
+            _pending_reboost[guild_id] = []
+        if after.id not in _pending_reboost[guild_id]:
+            _pending_reboost[guild_id].append(after.id)
         # Boost announcement (rate-limited to once/hour per guild)
         announce_role_id = config.get("boost_announce_role_id")
         announce_ch_id   = config.get("boost_announce_channel_id") or config.get("notification_channel_id")
@@ -6096,7 +6430,10 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     pass
     elif before.premium_since and after.premium_since:
         # Re-boost (adding another slot) → queue for on_guild_update
-        _pending_reboost[guild_id] = after.id
+        if guild_id not in _pending_reboost:
+            _pending_reboost[guild_id] = []
+        if after.id not in _pending_reboost[guild_id]:
+            _pending_reboost[guild_id].append(after.id)
 
     # ── Server tag reward ───────────────────────────────────────
     if config.get("server_tag_enabled", 0):
