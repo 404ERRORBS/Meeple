@@ -455,6 +455,12 @@ def init_db():
         "ALTER TABLE guild_config ADD COLUMN revive_ping_role_id INTEGER",
         "ALTER TABLE guild_config ADD COLUMN revive_ping_channels TEXT DEFAULT '[]'",
         "ALTER TABLE guild_config ADD COLUMN revive_ping_enabled INTEGER DEFAULT 0",
+        # Daily shop post channel
+        "ALTER TABLE guild_config ADD COLUMN daily_shop_channel_id INTEGER",
+        # Provided-by tag on shop items
+        "ALTER TABLE shop_items ADD COLUMN provided_by TEXT",
+        # Reaction message cancellation flag
+        "ALTER TABLE reaction_messages ADD COLUMN cancelled INTEGER DEFAULT 0",
     ]:
         try:
             conn.execute(migration)
@@ -810,9 +816,27 @@ def db_get_reaction_msg(guild_id: int, message_id: int) -> Optional[dict]:
 def db_add_reaction_msg(guild_id: int, message_id: int, target_uid: int, given_by: int, amount: int):
     conn = get_db()
     conn.execute("""INSERT OR IGNORE INTO reaction_messages
-                    (guild_id, message_id, target_uid, given_by_uid, amount, given_at)
-                    VALUES (?,?,?,?,?,?)""",
+                    (guild_id, message_id, target_uid, given_by_uid, amount, given_at, cancelled)
+                    VALUES (?,?,?,?,?,?,0)""",
                  (guild_id, message_id, target_uid, given_by, amount, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def db_cancel_reaction_msg(guild_id: int, message_id: int):
+    """Mark a reaction_messages row as cancelled (keeps it so ✅ cannot re-give)."""
+    conn = get_db()
+    conn.execute("UPDATE reaction_messages SET cancelled=1 WHERE guild_id=? AND message_id=?",
+                 (guild_id, message_id))
+    conn.commit()
+    conn.close()
+
+def db_block_reaction_msg(guild_id: int, message_id: int):
+    """Insert a pre-cancelled row so no ✅ award can happen on this message."""
+    conn = get_db()
+    conn.execute("""INSERT OR IGNORE INTO reaction_messages
+                    (guild_id, message_id, target_uid, given_by_uid, amount, given_at, cancelled)
+                    VALUES (?,?,0,0,0,?,1)""",
+                 (guild_id, message_id, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -2380,7 +2404,14 @@ async def post_or_update_info_embed(bot: commands.Bot, guild: discord.Guild, con
 
 
 def member_has_server_tag(member: discord.Member) -> bool:
-    """Return True if the member has the server's clan/guild tag enabled (discord.py 2.4+)."""
+    """Return True if the member has the server's clan/guild tag enabled (discord.py 2.4+).
+    Checks both MemberFlags.guild_tag_and_badge (2.4+) and the legacy guild_tag attribute."""
+    try:
+        flags = getattr(member, "flags", None)
+        if flags is not None and hasattr(flags, "guild_tag_and_badge"):
+            return bool(flags.guild_tag_and_badge)
+    except Exception:
+        pass
     return getattr(member, "guild_tag", None) is not None
 
 
@@ -2410,7 +2441,10 @@ async def _reward_server_tag(guild: discord.Guild, member: discord.Member, confi
         f"Reward: **+{cur(config, xp)}**  |  Balance: **{cur(config, new_xp)}**"
     )
     e.set_thumbnail(url=member.display_avatar.url if member.display_avatar else None)
-    await notify_xp(bot, guild_id, embed=e)
+    # Notify in the notification channel so the member sees they earned gems
+    await notify_xp(bot, guild_id,
+                    content=f"🏷️ {member.mention} just enabled the server tag and earned **+{cur(config, xp)}**!",
+                    embed=e)
     await bot_log(bot, guild_id, "🏷️ Server Tag Reward",
                   f"**Member:** {member.mention} ({member.display_name})\n"
                   f"**Reward:** +{cur(config, xp)}\n"
@@ -2720,6 +2754,7 @@ class ConfigChannelsMenu(_SubMenu):
         cat_id = config.get("ticket_category_id")
         e.add_field(name="🎫 Ticket Category",    value=f"`{cat_id}`" if cat_id else "`No category`",     inline=True)
         e.add_field(name="🎯 Reaction Channel",   value=_ch(config.get("reaction_channel_id")),           inline=True)
+        e.add_field(name="🛍️ Daily Shop Post",   value=_ch(config.get("daily_shop_channel_id")),          inline=True)
         e.add_field(name="\u200b", value=(
             "**Share** — members post link + screenshot here\n"
             "**Notifications** — invites, quests, achievements\n"
@@ -2825,6 +2860,11 @@ class ConfigChannelsMenu(_SubMenu):
     @discord.ui.button(label="Shop Channel",         style=discord.ButtonStyle.blurple, row=3)
     async def btn_shop_ch(self, interaction, btn):
         await self._ch_btn("Shop Channel", "shop_channel_id", "Set Shop Channel")(interaction, btn)
+
+    @discord.ui.button(label="🛍️ Daily Shop Post",  style=discord.ButtonStyle.blurple, row=3)
+    async def btn_daily_shop_ch(self, interaction, btn):
+        await self._ch_btn("Daily Shop Post Channel", "daily_shop_channel_id",
+                           "Daily Shop Post Channel")(interaction, btn)
 
     @discord.ui.button(label="Quests Channel",       style=discord.ButtonStyle.blurple, row=3)
     async def btn_quests_ch(self, interaction, btn):
@@ -3496,74 +3536,110 @@ class ConfigBoostAnnounceMenu(_SubMenu):
     @discord.ui.button(label="📢 Announce Channel", style=discord.ButtonStyle.blurple, row=0)
     async def btn_boost_channel(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
+        _view  = self
         async def submit(inter, value):
             if not value.strip():
-                db_set_config(self.guild.id, boost_announce_channel_id=None)
+                db_set_config(_view.guild.id, boost_announce_channel_id=None)
                 await inter.response.send_message(
                     "✅ Boost announce channel cleared — will use Notifications channel.", ephemeral=True)
             else:
-                cid = self._parse_ch(value)
+                cid = _view._parse_ch(value)
                 if not cid:
                     await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
-                db_set_config(self.guild.id, boost_announce_channel_id=cid)
+                db_set_config(_view.guild.id, boost_announce_channel_id=cid)
                 await inter.response.send_message(
                     f"✅ Boost announcements will go to <#{cid}>.", ephemeral=True)
-            await self._refresh(interaction)
-        await interaction.response.send_modal(Modal1(
-            title="Boost Announce Channel",
-            label="Channel mention or ID (empty = use Notifications)",
-            placeholder="#boosts  or  1234567890",
-            default=str(config.get("boost_announce_channel_id") or ""),
-            required=False, callback=submit))
+            # Refresh by directly editing the panel message
+            try:
+                cfg_new = db_get_config(_view.guild.id)
+                if getattr(interaction, "message", None):
+                    await interaction.message.edit(embed=_view.build_embed(cfg_new), view=_view)
+            except Exception:
+                pass
+        try:
+            await interaction.response.send_modal(Modal1(
+                title="Boost Announce Channel",
+                label="Channel mention or ID (empty = Notifications)",
+                placeholder="#boosts  or  1234567890",
+                default=str(config.get("boost_announce_channel_id") or ""),
+                required=False, callback=submit))
+        except Exception as e:
+            print(f"[BoostChannel modal error] {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Could not open the modal. Please try again.", ephemeral=True)
 
     @discord.ui.button(label="📣 Boost Mention Role", style=discord.ButtonStyle.blurple, row=0)
     async def btn_boost_role(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
+        _view  = self
         async def submit(inter, value):
             if not value.strip():
-                db_set_config(self.guild.id, boost_announce_role_id=None)
+                db_set_config(_view.guild.id, boost_announce_role_id=None)
                 await inter.response.send_message(
                     "✅ Boost mention role removed — no role will be pinged.", ephemeral=True)
             else:
-                rid = self._parse_role(value)
+                rid = _view._parse_role(value)
                 if not rid:
                     await inter.response.send_message("❌ Invalid role.", ephemeral=True); return
-                db_set_config(self.guild.id, boost_announce_role_id=rid)
+                db_set_config(_view.guild.id, boost_announce_role_id=rid)
                 await inter.response.send_message(
                     f"✅ Boost announcements will mention <@&{rid}>.", ephemeral=True)
-            await self._refresh(interaction)
-        await interaction.response.send_modal(Modal1(
-            title="Boost Announce Role",
-            label="Role mention or ID (empty = no mention)",
-            placeholder="@Booster  or  1234567890",
-            default=str(config.get("boost_announce_role_id") or ""),
-            required=False, callback=submit))
+            # Refresh by directly editing the panel message
+            try:
+                cfg_new = db_get_config(_view.guild.id)
+                if getattr(interaction, "message", None):
+                    await interaction.message.edit(embed=_view.build_embed(cfg_new), view=_view)
+            except Exception:
+                pass
+        try:
+            await interaction.response.send_modal(Modal1(
+                title="Boost Announce Role",
+                label="Role mention or ID (empty = no ping)",
+                placeholder="@Booster  or  1234567890",
+                default=str(config.get("boost_announce_role_id") or ""),
+                required=False, callback=submit))
+        except Exception as e:
+            print(f"[BoostRole modal error] {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Could not open the modal. Please try again.", ephemeral=True)
 
     @discord.ui.button(label="🏷️ Toggle Server Tag", style=discord.ButtonStyle.green, row=1)
     async def btn_tag_toggle(self, interaction: discord.Interaction, btn):
         config  = db_get_config(self.guild.id)
         new_val = 0 if config.get("server_tag_enabled", 0) else 1
         db_set_config(self.guild.id, server_tag_enabled=new_val)
-        await interaction.response.send_message(
+        await interaction.response.defer()
+        try:
+            cfg_new = db_get_config(self.guild.id)
+            if getattr(interaction, "message", None):
+                await interaction.message.edit(embed=self.build_embed(cfg_new), view=self)
+        except Exception:
+            pass
+        await interaction.followup.send(
             f"✅ Server tag reward {'enabled' if new_val else 'disabled'}.", ephemeral=True)
-        await self._refresh(interaction)
 
     @discord.ui.button(label="🏷️ Tag Reward Amount", style=discord.ButtonStyle.blurple, row=1)
     async def btn_tag_xp(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
+        _view  = self
         async def submit(inter, value):
             try:
                 xp = int(value)
                 if xp < 0: raise ValueError
             except ValueError:
                 await inter.response.send_message("❌ Enter a non-negative number.", ephemeral=True); return
-            db_set_config(self.guild.id, server_tag_xp=xp)
-            cfg2 = db_get_config(self.guild.id)
+            db_set_config(_view.guild.id, server_tag_xp=xp)
+            cfg2 = db_get_config(_view.guild.id)
             await inter.response.send_message(
                 f"✅ Server tag reward set to **{cur(cfg2, xp)}**.", ephemeral=True)
-            await self._refresh(interaction)
+            try:
+                cfg_new = db_get_config(_view.guild.id)
+                if getattr(interaction, "message", None):
+                    await interaction.message.edit(embed=_view.build_embed(cfg_new), view=_view)
+            except Exception:
+                pass
         await interaction.response.send_modal(Modal1(
-            "Server Tag Reward", "Gems awarded for enabling the server tag",
+            "Server Tag Reward", "Gems awarded for enabling server tag",
             placeholder="100", default=str(config.get("server_tag_xp", 100)), callback=submit))
 
     # ← Back is inherited from _SubMenu — no duplicate needed
@@ -3988,27 +4064,32 @@ class ConfigShopMenu(_SubMenu):
         if not items:
             await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
             return
+        config_now = db_get_config(self.guild.id)
         options = [
             discord.SelectOption(
-                label=f"{item['name'][:70]}  —  {cur(db_get_config(self.guild.id), item['price'])}",
+                label=f"{item['name'][:70]}  —  {cur(config_now, item['price'])}",
                 description="🖼️ has image" if item.get("image_url") else "No image yet",
                 value=str(item["id"])
             )
             for item in items[:25]
         ]
-        view = discord.ui.View(timeout=60)
-        sel = discord.ui.Select(placeholder="Choose item to add/replace image URL", options=options)
+        sel       = discord.ui.Select(placeholder="Choose item to add/replace image URL", options=options)
+        tmp_view  = discord.ui.View(timeout=120)
         guild_ref = self.guild
-        parent = interaction
+        panel_msg = interaction   # the button interaction (has .message = the panel)
+        author_id = self.author_id
+        view_ref  = self
         all_items = items
-        async def on_select(inter2):
-            if inter2.user.id != self.author_id:
+        async def on_select(inter2: discord.Interaction):
+            if inter2.user.id != author_id:
                 await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
                 return
-            item_id = int(sel.values[0])
-            chosen = next((i for i in all_items if i["id"] == item_id), None)
-            item_name = chosen["name"] if chosen else "item"
-            async def url_submit(inter3, value):
+            item_id   = int(sel.values[0])
+            chosen    = next((i for i in all_items if i["id"] == item_id), None)
+            item_name = (chosen["name"] if chosen else "item")
+            # Title must be ≤ 45 chars; keep up to 28 chars of item name (12 prefix + 28 = 40)
+            modal_title = f"Set Image — {item_name[:28]}"
+            async def url_submit(inter3: discord.Interaction, value: str):
                 v = value.strip()
                 if not v:
                     conn = get_db()
@@ -4018,21 +4099,95 @@ class ConfigShopMenu(_SubMenu):
                     await inter3.response.send_message(f"✅ Image removed from **{item_name}**.", ephemeral=True)
                 else:
                     db_update_shop_image(item_id, guild_ref.id, v)
-                    await inter3.response.send_message(f"✅ Image URL set for **{item_name}**!", ephemeral=True)
-                await self._refresh(parent)
-            await inter2.response.send_modal(Modal1(
-                f"Set Image — {item_name[:40]}",
-                "Image URL (empty = remove)",
-                placeholder="https://i.imgur.com/xxxx.png",
-                default=chosen.get("image_url") or "" if chosen else "",
-                required=False, callback=url_submit
-            ))
+                    await inter3.response.send_message(f"✅ Image set for **{item_name}**!", ephemeral=True)
+                # Refresh the panel via the original button's message
+                try:
+                    cfg_new = db_get_config(guild_ref.id)
+                    if getattr(panel_msg, "message", None):
+                        await panel_msg.message.edit(embed=view_ref.build_embed(cfg_new), view=view_ref)
+                except Exception:
+                    pass
+            try:
+                await inter2.response.send_modal(Modal1(
+                    modal_title,
+                    "Image URL (empty = remove)",
+                    placeholder="https://i.imgur.com/xxxx.png",
+                    default=chosen.get("image_url") or "" if chosen else "",
+                    required=False, callback=url_submit
+                ))
+            except Exception as e:
+                print(f"[SetImage modal error] {e}")
+                if not inter2.response.is_done():
+                    await inter2.response.send_message("❌ Could not open modal. Please try again.", ephemeral=True)
         sel.callback = on_select
-        view.add_item(sel)
+        tmp_view.add_item(sel)
         await interaction.response.send_message(
             "🖼️ Choose an item to set its image URL.\n"
             "💡 Tip: upload your image to [imgur.com](https://imgur.com) or any image host and paste the direct link.",
-            view=view, ephemeral=True
+            view=tmp_view, ephemeral=True
+        )
+
+    @discord.ui.button(label="🤝 Set Provider", style=discord.ButtonStyle.grey, row=2)
+    async def btn_set_provider(self, interaction: discord.Interaction, btn):
+        """Set or clear the 'Provided by' credit shown on a shop item."""
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        config_now = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{item['name'][:70]}  —  {cur(config_now, item['price'])}",
+                description=f"Provider: {item['provided_by']}" if item.get("provided_by") else "No provider set",
+                value=str(item["id"])
+            )
+            for item in items[:25]
+        ]
+        sel       = discord.ui.Select(placeholder="Choose item to set provider", options=options)
+        tmp_view  = discord.ui.View(timeout=120)
+        guild_ref = self.guild
+        panel_msg = interaction
+        author_id = self.author_id
+        view_ref  = self
+        all_items = items
+        async def on_select(inter2: discord.Interaction):
+            if inter2.user.id != author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id   = int(sel.values[0])
+            chosen    = next((i for i in all_items if i["id"] == item_id), None)
+            item_name = chosen["name"] if chosen else "item"
+            async def prov_submit(inter3: discord.Interaction, value: str):
+                v = value.strip()
+                conn = get_db()
+                conn.execute("UPDATE shop_items SET provided_by=? WHERE id=? AND guild_id=?",
+                             (v or None, item_id, guild_ref.id))
+                conn.commit(); conn.close()
+                if v:
+                    await inter3.response.send_message(
+                        f"✅ **{item_name}** will show \"Provided by {v}\".", ephemeral=True)
+                else:
+                    await inter3.response.send_message(
+                        f"✅ Provider credit removed from **{item_name}**.", ephemeral=True)
+                try:
+                    cfg_new = db_get_config(guild_ref.id)
+                    if getattr(panel_msg, "message", None):
+                        await panel_msg.message.edit(embed=view_ref.build_embed(cfg_new), view=view_ref)
+                except Exception:
+                    pass
+            await inter2.response.send_modal(Modal1(
+                f"Set Provider — {item_name[:26]}",
+                "Provided by (empty = remove)",
+                placeholder="@username  or  Server Name",
+                default=chosen.get("provided_by") or "" if chosen else "",
+                required=False, callback=prov_submit
+            ))
+        sel.callback = on_select
+        tmp_view.add_item(sel)
+        await interaction.response.send_message(
+            "🤝 Choose an item to set its **Provided by** credit.\n"
+            "Enter a name or `@mention`. Leave blank to remove.",
+            view=tmp_view, ephemeral=True
         )
 
     @discord.ui.button(label="✏️ Edit Expiry", style=discord.ButtonStyle.blurple, row=1)
@@ -5467,6 +5622,8 @@ async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: dis
     )
     if shop_item.get("image_url"):
         ticket_embed.set_thumbnail(url=shop_item["image_url"])
+    if shop_item.get("provided_by"):
+        ticket_embed.add_field(name="🤝 Provided by", value=shop_item["provided_by"], inline=True)
     ticket_embed.set_footer(text="Review the request and close this channel when done.")
 
     try:
@@ -5679,6 +5836,10 @@ class ShopView(discord.ui.View):
             if item.get("image_url"):
                 ie.set_image(url=item["image_url"])
 
+            # Provided-by credit
+            if item.get("provided_by"):
+                ie.add_field(name="🤝 Provided by", value=item["provided_by"], inline=True)
+
             # Show stock info
             item_id = item.get("id")
             if item_id:
@@ -5826,7 +5987,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 #  BACKGROUND TASKS
 # ══════════════════════════════════════════════════════════════
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=1)
 async def check_youtube():
     await bot.wait_until_ready()
     conn = get_db()
@@ -6084,6 +6245,72 @@ async def before_daily_quests():
 
 
 @tasks.loop(hours=24)
+async def send_daily_shop():
+    """Every day at 08:00 UTC, post a compact shop overview in the configured channel."""
+    await bot.wait_until_ready()
+    conn = get_db()
+    guilds = conn.execute(
+        "SELECT guild_id FROM guild_config WHERE daily_shop_channel_id IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    for row in guilds:
+        guild_id = row["guild_id"]
+        config   = db_get_config(guild_id)
+        ch_id    = config.get("daily_shop_channel_id")
+        if not ch_id:
+            continue
+        ch = bot.get_channel(ch_id)
+        if not ch:
+            continue
+        items = db_get_shop_items(guild_id)
+        if not items:
+            continue
+        c_name  = config.get("currency_name")  or "Gems"
+        c_emoji = config.get("currency_emoji") or "💎"
+        shop_ch = config.get("shop_channel_id") or config.get("commands_channel_id")
+        shop_ch_str = f"<#{shop_ch}>" if shop_ch else "the shop channel"
+        # Build a compact embed per item — thumbnail only, no details
+        embeds = []
+        header = discord.Embed(
+            title="🛍️ Today's Shop",
+            description=f"Here's what's available right now. Use `/shop` in {shop_ch_str} to buy!",
+            color=C_GOLD
+        )
+        header.timestamp = datetime.utcnow()
+        embeds.append(header)
+        for item in items:
+            stock_info = ""
+            if item.get("stock") is not None:
+                if item["stock"] == 0:
+                    stock_info = " — **Sold out**"
+                else:
+                    stock_info = f" — **{item['stock']} left**"
+            line = f"{c_emoji} **{item['price']:,} {c_name}**{stock_info}"
+            ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
+            if item.get("image_url"):
+                ie.set_thumbnail(url=item["image_url"])
+            if item.get("provided_by"):
+                ie.set_footer(text=f"Provided by {item['provided_by']}")
+            embeds.append(ie)
+        # Discord allows up to 10 embeds per message
+        for i in range(0, len(embeds), 10):
+            try:
+                await ch.send(embeds=embeds[i:i+10])
+            except Exception as ex:
+                print(f"[DailyShop] Error posting for guild {guild_id}: {ex}")
+
+@send_daily_shop.before_loop
+async def before_daily_shop():
+    """Wait until 08:00 UTC to start the daily shop post loop."""
+    await bot.wait_until_ready()
+    now    = datetime.utcnow()
+    target = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    await asyncio.sleep((target - now).total_seconds())
+
+
+@tasks.loop(hours=24)
 async def send_revive_ping_button():
     """Once per day, post a revive-ping opt-in button in ONE random configured channel per guild."""
     await bot.wait_until_ready()
@@ -6124,12 +6351,10 @@ async def send_revive_ping_button():
                 continue
             try:
                 view = RevivePingView(guild_id, role_id)
-                role = ch.guild.get_role(role_id)
-                role_mention = role.mention if role else "@revive-ping"
                 await ch.send(
-                    f"🔔 **Want to help keep the chat alive?**\n"
-                    f"Click below to toggle the {role_mention} role.\n"
-                    f"You'll get pinged when the chat needs a boost — and you can remove it any time!",
+                    "🔔 **Want to help keep the chat alive?**\n"
+                    "Click the button below to get (or remove) the **revive ping** role.\n"
+                    "You'll be pinged when the chat needs a boost — you can opt out any time!",
                     view=view
                 )
                 conn3 = get_db()
@@ -6146,12 +6371,18 @@ async def send_revive_ping_button():
 
 @send_revive_ping_button.before_loop
 async def before_revive_ping():
-    """Wait until a fixed time each day (12:00 UTC) to post the revive ping button."""
+    """Wait until a random time between 12:00 and 20:00 UTC to post the revive ping button."""
     await bot.wait_until_ready()
-    now = datetime.utcnow()
-    target = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    now  = datetime.utcnow()
+    hour = _random.randint(12, 19)          # 12:xx – 19:xx UTC
+    mins = _random.randint(0, 59)
+    target = now.replace(hour=hour, minute=mins, second=0, microsecond=0)
     if now >= target:
         target += timedelta(days=1)
+        # Re-randomise for the next day
+        hour = _random.randint(12, 19)
+        mins = _random.randint(0, 59)
+        target = target.replace(hour=hour, minute=mins)
     await asyncio.sleep((target - now).total_seconds())
 
 
@@ -6175,7 +6406,7 @@ async def on_ready():
             pass
     for loop in [check_youtube, auto_backup, check_expired_items, check_community_goals,
                  check_streak_reminders, check_share_channel_lock, renew_websub_subscriptions,
-                 check_daily_quests, send_revive_ping_button]:
+                 check_daily_quests, send_revive_ping_button, send_daily_shop]:
         if not loop.is_running():
             loop.start()
     # Initial WebSub subscription for all configured channels
@@ -6502,16 +6733,24 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
     # ── Cancel emoji: revoke a previously awarded gem bonus on this message ──
     cancel_emoji = config.get("cancel_emoji", "❌")
-    if emoji_str == cancel_emoji and is_xp_manager(actor, config):
+    # Normalise variation selectors so ❌️ == ❌
+    def _norm_emoji(s: str) -> str:
+        return s.replace("\ufe0f", "").replace("\ufe0e", "")
+    if _norm_emoji(emoji_str) == _norm_emoji(cancel_emoji) and is_xp_manager(actor, config):
         existing = db_get_reaction_msg(payload.guild_id, payload.message_id)
-        if existing:
+        if existing and not existing.get("cancelled"):
             target_id = existing["target_uid"]
             amount    = existing["amount"]
-            new_xp    = db_add_xp(payload.guild_id, target_id, -amount)
-            db_remove_reaction_msg(payload.guild_id, payload.message_id)
+            # Remove gems only if amount > 0 (won't double-deduct pre-blocked rows)
+            if amount > 0:
+                new_xp = db_add_xp(payload.guild_id, target_id, -amount)
+            else:
+                new_xp = db_get_xp(payload.guild_id, target_id)
+            # Mark cancelled so ✅ cannot re-give on this message
+            db_cancel_reaction_msg(payload.guild_id, payload.message_id)
             config_r = db_get_config(payload.guild_id)
             channel = bot.get_channel(payload.channel_id)
-            if channel:
+            if channel and amount > 0:
                 try:
                     await channel.send(
                         f"❌ {config_r.get('currency_emoji', '💎')} Reward cancelled for <@{target_id}> — "
@@ -6520,13 +6759,24 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 except Exception:
                     pass
             target_member = guild.get_member(target_id)
-            if target_member:
+            if target_member and amount > 0:
                 try:
                     await target_member.send(
                         f"❌ **Your reward was cancelled** in **{guild.name}**.\n"
                         f"Lost: **{cur(config_r, amount)}** — make sure your share clearly shows "
                         f"your comment and the video link, then try again! 💪"
                     )
+                except Exception:
+                    pass
+        elif not existing:
+            # No prior award: pre-block this message so ✅ cannot reward it later
+            db_block_reaction_msg(payload.guild_id, payload.message_id)
+            channel = bot.get_channel(payload.channel_id)
+            if channel:
+                try:
+                    await channel.send(
+                        f"🚫 Message blocked — no {config.get('currency_emoji', '💎')} reward can be given for it.",
+                        delete_after=10)
                 except Exception:
                     pass
         return
@@ -6553,8 +6803,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     target = message.author
     if target.bot or target.id == actor.id:
         return
-    if db_get_reaction_msg(payload.guild_id, payload.message_id):
-        return
+    existing_rm = db_get_reaction_msg(payload.guild_id, payload.message_id)
+    if existing_rm:
+        return  # already rewarded, or blocked/cancelled — no re-give
     react_xp   = config.get("reaction_xp", 50)
     cooldown_h = config.get("reaction_cooldown_h", 1)
     can_give, mins_left = db_reaction_cooldown_ok(payload.guild_id, target.id, cooldown_h)
@@ -6637,12 +6888,14 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if emoji_str != configured or not is_xp_manager(actor, config):
         return
     existing = db_get_reaction_msg(payload.guild_id, payload.message_id)
-    if not existing:
+    # Only revoke if it was actually awarded (not a pre-block / cancelled row)
+    if not existing or existing.get("cancelled") or existing.get("amount", 0) == 0:
         return
     target_id = existing["target_uid"]
     amount    = existing["amount"]
     new_xp    = db_add_xp(payload.guild_id, target_id, -amount)
-    db_remove_reaction_msg(payload.guild_id, payload.message_id)
+    # Mark cancelled instead of deleting — prevents re-give with ✅
+    db_cancel_reaction_msg(payload.guild_id, payload.message_id)
     config_r2 = db_get_config(payload.guild_id)
     # DM the member to explain that their bonus was revoked
     target_member = guild.get_member(target_id)

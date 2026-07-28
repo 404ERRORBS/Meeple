@@ -1,6 +1,6 @@
 # Meeple Bot — Deployment Guide (v2.9)
 
-A Discord bot that manages a fully configurable economy for your server: video sharing, reaction rewards, streaks, a shop, quests, achievements, daily quests, boost announcements, and a daily revive-ping button. The currency name and emoji are customizable per server via `/config`.
+A Discord bot that manages a fully configurable economy for your server: video sharing, reaction rewards, streaks, a shop, quests, achievements, daily quests, boost announcements, a daily shop post, and a daily revive-ping button. The currency name and emoji are customizable per server via `/config`.
 
 ---
 
@@ -58,6 +58,7 @@ Once running, use **`/config`** to set everything up.
 | Backup Channel | Where the DB backup file is sent every 15 min |
 | Admin Commands Channel | Staff-only channel that bypasses all channel restrictions |
 | Reaction Channel | Restrict Meeple Owner reactions to this channel |
+| **🛍️ Daily Shop Post** | Channel where the daily shop overview is posted every day at 08:00 UTC |
 | **📢 Announce Message** | Customise the new-video announcement message |
 
 ### 2. Economy (`💰 Economy`)
@@ -100,12 +101,20 @@ The snooze duration is configurable in **minutes, hours, or days** (e.g. `30m`, 
 
 > **Gems Bonus Owner:** By default shows `404ERROR`. Set it to your Discord user ID so the quest shows your clickable @mention and the instructions say "ping them to ask!".
 
-### 7. Boost Announce (`🚀 Boost Announce`)
+### 7. Shop (`🛒 Shop`)
+
+| Setting | Purpose |
+|---|---|
+| Add / Remove items | Manage the shop catalogue |
+| Set image | Thumbnail shown in `/shop` and purchase tickets |
+| **🤝 Set Provider** | Credit text shown on the item (e.g. `Sponsor Name`) — appears in `/shop`, in the purchase ticket, and in the daily shop post |
+
+### 8. Boost Announce (`🚀 Boost Announce`)
 Configure the channel and role mentioned when a member boosts the server.
 - **Bug fix v2.9:** simultaneous boosts from multiple members are now all detected and rewarded correctly.
-- **Bug fix v2.9:** channel configuration now saves reliably (interaction timeout fixed).
+- **Bug fix v2.9:** channel and role configuration now saves reliably (interaction timeout fixed).
 
-### 8. Revive Ping (`🔔 Revive Ping`) — New in v2.9
+### 9. Revive Ping (`🔔 Revive Ping`)
 
 | Setting | Purpose |
 |---|---|
@@ -115,9 +124,9 @@ Configure the channel and role mentioned when a member boosts the server.
 | ➖ Remove Channel | Remove a channel from the pool |
 
 **How it works:**
-- Once per day at **12:00 UTC**, the bot posts a button in **one random channel** from your configured pool.
-- Members click **🔔 Toggle Revive Ping role** to opt in or out.
-- Clicking again removes the role (toggle behaviour).
+- Once per day at a **random time between 12:00 and 20:00 UTC**, the bot posts a button in **one random channel** from your configured pool.
+- The message does **not** ping the role — it only shows the opt-in button.
+- Members click **🔔 Toggle Revive Ping role** to opt in or out (toggle behaviour).
 - The goal is to maintain a pool of members to ping when the chat goes quiet.
 
 ---
@@ -167,31 +176,39 @@ Enable these in the [Discord Developer Portal](https://discord.com/developers/ap
 
 ## Changelog
 
-### v2.9 — Daily quest improvements · Boost fix · Revive Ping
-
-**New Features**
-
-1. **Daily Quest: "send messages" now shows a clickable #channel**
-   - Configure the target channel in `/config → 🗓️ Daily Quests → 💬 Chat Channel`.
-   - The quest displays `<#channel>` as a clickable Discord link.
-
-2. **Daily Quest: "gems bonus" shows a configurable owner @mention**
-   - Renamed from "reaction bonus from Meeple Owner" → "gems bonus from @owner (ping them to ask!)".
-   - Set your Discord user ID in `/config → 🗓️ Daily Quests → 👑 Gems Bonus Owner`.
-   - The @mention is clickable. Default shows `404ERROR` when not configured.
-
-3. **🔔 Revive Ping — new feature**
-   - Once per day at 12:00 UTC, the bot posts a toggle button in a random channel from your pool.
-   - Members click to opt in/out of the @revive-ping role.
-   - Fully configurable: role, channels pool, and toggle in `/config → 🔔 Revive Ping`.
+### v2.9 — Bug fixes · New features · Daily shop post
 
 **Bug Fixes**
 
-4. **Boost announce channel config — "interaction failed" fixed**
-   - The `_refresh` method now falls back to direct message editing when the interaction token is a modal token, preventing the "This interaction failed" error.
+1. **Boost announce channel/role config — "This interaction failed" fixed**
+   - Button → modal → refresh pattern was calling `edit_original_response()` on a modal token. Now refreshes via direct message edit.
 
-5. **Boost detection — simultaneous boosters now all rewarded**
-   - Changed internal tracking from a single member ID per guild to a list, so two members boosting at the same moment both receive their XP.
+2. **Set Image URL — "This interaction failed" fixed**
+   - Modal title could exceed Discord's 45-character limit. Item name is now capped so the title stays within the limit.
+
+3. **Server tag gems not awarded**
+   - `member_has_server_tag()` was checking a `guild_tag` attribute that no longer exists in discord.py 2.4+. Now uses `member.flags.guild_tag_and_badge`. Member is also mentioned in the public notification so they know they earned gems.
+
+4. **Reaction ❌ cancel did nothing / ✅ could re-give after cancel**
+   - Added `cancelled` column to `reaction_messages`. Cancel now marks the row instead of deleting it, so a second ✅ can never re-give. ❌ on a message that was never rewarded now pre-blocks it too.
+
+5. **Revive ping posts at a random time, no role ping in message**
+   - Post time is now randomised between 12:00 and 20:00 UTC each day instead of always at noon.
+   - The message no longer pings the role — it only shows the opt-in button.
+
+6. **YouTube detection — polling interval reduced**
+   - RSS fallback polling reduced from 5 minutes to 1 minute for servers without `WEBHOOK_URL`.
+
+**New Features**
+
+7. **🤝 Shop "Provided by" credit**
+   - New "🤝 Set Provider" button in `/config → Shop`.
+   - Provider name is shown in `/shop` item embeds, in the purchase ticket, and in the daily shop post.
+
+8. **🛍️ Daily shop post at 08:00 UTC**
+   - Every day at 08:00 UTC the bot posts a compact shop overview (name, price, stock, thumbnail) in a configurable channel.
+   - Set the channel in `/config → 💬 Channels → 🛍️ Daily Shop Post`.
+   - Out-of-stock items show as **Sold out**. Message ends with a pointer to the `/shop` command.
 
 ### v2.8 — DM fix · Notification prompt · UI reorganisation
 ### v2.7 — Bug fixes: DMs · Boost Announce · Notification Prompt
