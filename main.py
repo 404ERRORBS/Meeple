@@ -122,17 +122,24 @@ QUEST_POOL = {
 # ── Daily quest pool — simple tasks achievable in one day ─────
 DAILY_QUEST_POOL = [
     {"key": "dq_share_1",    "name": "Share today's video",                  "type": "dq_share",    "target": 1},
-    {"key": "dq_first5",     "name": "Be among the first 5 to share",        "type": "dq_first5",   "target": 1},
-    {"key": "dq_first3",     "name": "Be among the first 3 to share",        "type": "dq_first3",   "target": 1},
-    {"key": "dq_first1",     "name": "Be the very first to share",           "type": "dq_first1",   "target": 1},
+    # Position quests — grouped so only ONE is assigned per day (see db_assign_daily_quests)
+    {"key": "dq_first5",     "name": "Be among the first 5 to share",        "type": "dq_first5",   "target": 1, "group": "position"},
+    {"key": "dq_first3",     "name": "Be among the first 3 to share",        "type": "dq_first3",   "target": 1, "group": "position"},
+    {"key": "dq_first1",     "name": "Be the very first to share",           "type": "dq_first1",   "target": 1, "group": "position"},
     {"key": "dq_invite",     "name": "Invite a new member",                  "type": "dq_invite",   "target": 1},
     {"key": "dq_check_gems", "name": "Check your balance with /gems",        "type": "dq_checkin",  "target": 1},
-    {"key": "dq_check_q",    "name": "View your quests with /quests",        "type": "dq_checkq",   "target": 1},
     {"key": "dq_share_top10","name": "Share and be in the top 10",           "type": "dq_top10",    "target": 1},
-    {"key": "dq_get_react",  "name": "Get a gems bonus from 404ERROR (ping them to ask!)", "type": "dq_get_react", "target": 1},
+    {"key": "dq_get_react",  "name": "Get a gems bonus from 404ERROR (ping him to ask!)", "type": "dq_get_react", "target": 1},
     # dq_messages: target and channel are resolved at assignment time
     {"key": "dq_messages",   "name": "Send {n} messages in the chat",        "type": "dq_messages", "target": 20},
 ]
+
+# Groups of quest keys that are mutually exclusive (only one from each group is assigned per day)
+_DAILY_QUEST_GROUPS: dict[str, list] = {}
+for _q in DAILY_QUEST_POOL:
+    _g = _q.get("group")
+    if _g:
+        _DAILY_QUEST_GROUPS.setdefault(_g, []).append(_q["key"])
 
 # Achievement definitions — add entries to extend
 ACHIEVEMENT_DEFS = [
@@ -461,6 +468,14 @@ def init_db():
         "ALTER TABLE shop_items ADD COLUMN provided_by TEXT",
         # Reaction message cancellation flag
         "ALTER TABLE reaction_messages ADD COLUMN cancelled INTEGER DEFAULT 0",
+        # Shop: per-item approval requirement and per-person purchase limit
+        "ALTER TABLE shop_items ADD COLUMN requires_approval INTEGER DEFAULT 0",
+        "ALTER TABLE shop_items ADD COLUMN purchase_limit INTEGER DEFAULT NULL",
+        "ALTER TABLE shop_items ADD COLUMN show_purchase_limit INTEGER DEFAULT 1",
+        # Gift gems: configurable daily send cap and receive cooldown (hours)
+        "ALTER TABLE guild_config ADD COLUMN give_max_daily INTEGER DEFAULT 100",
+        "ALTER TABLE guild_config ADD COLUMN give_receive_cooldown_h INTEGER DEFAULT 24",
+        "ALTER TABLE guild_config ADD COLUMN give_enabled INTEGER DEFAULT 0",
     ]:
         try:
             conn.execute(migration)
@@ -485,6 +500,19 @@ def init_db():
         date_key   TEXT,
         channel_id INTEGER,
         PRIMARY KEY (guild_id, date_key)
+    )""")
+
+    # share_log: tracks the XP and streak given for each validated share so ❌ can fully revert it
+    conn.execute("""CREATE TABLE IF NOT EXISTS share_log (
+        guild_id      INTEGER,
+        message_id    INTEGER,
+        user_id       INTEGER,
+        video_id      TEXT,
+        xp_given      INTEGER DEFAULT 0,
+        streak_before INTEGER DEFAULT 0,
+        new_streak    INTEGER DEFAULT 0,
+        cancelled     INTEGER DEFAULT 0,
+        PRIMARY KEY (guild_id, message_id)
     )""")
 
     # Fix daily_quests PRIMARY KEY — original schema only had (guild_id, user_id, date_key),
@@ -514,6 +542,32 @@ def init_db():
     except Exception:
         pass
 
+    # Pending shop purchases — for items that require Gems Owner approval
+    conn.execute("""CREATE TABLE IF NOT EXISTS shop_pending_purchases (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     INTEGER,
+        user_id      INTEGER,
+        item_id      INTEGER,
+        item_name    TEXT,
+        item_price   INTEGER,
+        item_text    TEXT,
+        status       TEXT DEFAULT 'pending',
+        created_at   TEXT DEFAULT (datetime('now')),
+        resolved_at  TEXT,
+        resolved_by  INTEGER
+    )""")
+
+    # Gems gift log — tracks daily give/receive for the /give command
+    conn.execute("""CREATE TABLE IF NOT EXISTS gems_gifts (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     INTEGER,
+        sender_id    INTEGER,
+        recipient_id INTEGER,
+        amount       INTEGER,
+        given_at     TEXT DEFAULT (datetime('now'))
+    )""")
+
+    conn.commit()
     conn.close()
 
 # ── Config helpers ─────────────────────────────────────────────
@@ -568,7 +622,7 @@ def db_add_xp(guild_id: int, user_id: int, amount: int) -> int:
     new_xp = conn.execute("SELECT xp FROM xp_data WHERE guild_id=? AND user_id=?",
                           (guild_id, user_id)).fetchone()["xp"]
     conn.close()
-    return max(0, new_xp)
+    return new_xp  # Negative balances are intentionally allowed
 
 def db_set_xp(guild_id: int, user_id: int, amount: int):
     conn = get_db()
@@ -588,6 +642,39 @@ def db_top_xp(guild_id: int, limit: int = 10) -> list:
     return [(r["user_id"], r["xp"]) for r in rows]
 
 # ── Video share helpers ────────────────────────────────────────
+
+def db_log_share(guild_id: int, message_id: int, user_id: int, video_id: str,
+                 xp_given: int, streak_before: int, new_streak: int):
+    """Record the XP and streak awarded for a validated share (for ❌ cancel/revert)."""
+    conn = get_db()
+    conn.execute("""INSERT OR REPLACE INTO share_log
+                    (guild_id, message_id, user_id, video_id, xp_given, streak_before, new_streak, cancelled)
+                    VALUES (?,?,?,?,?,?,?,0)""",
+                 (guild_id, message_id, user_id, video_id, xp_given, streak_before, new_streak))
+    conn.commit()
+    conn.close()
+
+def db_get_share_log(guild_id: int, message_id: int) -> Optional[dict]:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM share_log WHERE guild_id=? AND message_id=?",
+                       (guild_id, message_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def db_cancel_share_log(guild_id: int, message_id: int):
+    conn = get_db()
+    conn.execute("UPDATE share_log SET cancelled=1 WHERE guild_id=? AND message_id=?",
+                 (guild_id, message_id))
+    conn.commit()
+    conn.close()
+
+def db_remove_share(guild_id: int, video_id: str, user_id: int):
+    """Remove a video_shares entry so the member can retry posting."""
+    conn = get_db()
+    conn.execute("DELETE FROM video_shares WHERE guild_id=? AND video_id=? AND user_id=?",
+                 (guild_id, video_id, user_id))
+    conn.commit()
+    conn.close()
 
 def db_has_shared(guild_id: int, video_id: str, user_id: int) -> bool:
     conn = get_db()
@@ -781,6 +868,83 @@ def db_add_inventory(guild_id: int, user_id: int, item_name: str,
     conn.commit()
     conn.close()
 
+def db_count_user_purchases(item_name: str, guild_id: int, user_id: int) -> int:
+    """Return how many times a user has purchased an item (by name) in this guild."""
+    conn = get_db()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM inventory WHERE guild_id=? AND user_id=? AND item_name=?",
+        (guild_id, user_id, item_name)
+    ).fetchone()[0]
+    conn.close()
+    return count
+
+def db_add_pending_purchase(guild_id: int, user_id: int, item_id: int,
+                            item_name: str, item_price: int,
+                            item_text: Optional[str]) -> int:
+    """Insert a pending purchase and return its id."""
+    conn = get_db()
+    cur_row = conn.execute(
+        "INSERT INTO shop_pending_purchases (guild_id, user_id, item_id, item_name, item_price, item_text) "
+        "VALUES (?,?,?,?,?,?)",
+        (guild_id, user_id, item_id, item_name, item_price, item_text)
+    )
+    purchase_id = cur_row.lastrowid
+    conn.commit()
+    conn.close()
+    return purchase_id
+
+def db_get_pending_purchase(purchase_id: int) -> Optional[dict]:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM shop_pending_purchases WHERE id=?", (purchase_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def db_resolve_pending_purchase(purchase_id: int, status: str, resolved_by: int):
+    conn = get_db()
+    conn.execute(
+        "UPDATE shop_pending_purchases SET status=?, resolved_at=?, resolved_by=? WHERE id=?",
+        (status, datetime.utcnow().isoformat(), resolved_by, purchase_id)
+    )
+    conn.commit()
+    conn.close()
+
+# ── Gift gems helpers ──────────────────────────────────────────
+
+def db_gifts_sent_today(guild_id: int, sender_id: int) -> int:
+    """Total gems sent as gifts by this user today."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM gems_gifts "
+        "WHERE guild_id=? AND sender_id=? AND date(given_at)=?",
+        (guild_id, sender_id, today)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def db_gifts_received_today(guild_id: int, recipient_id: int) -> int:
+    """Number of gifts received by this user today (capped at 1 per day by default)."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM gems_gifts "
+        "WHERE guild_id=? AND recipient_id=? AND date(given_at)=?",
+        (guild_id, recipient_id, today)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def db_record_gift(guild_id: int, sender_id: int, recipient_id: int, amount: int):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO gems_gifts (guild_id, sender_id, recipient_id, amount) VALUES (?,?,?,?)",
+        (guild_id, sender_id, recipient_id, amount)
+    )
+    conn.commit()
+    conn.close()
+
 # ── Reaction helpers ───────────────────────────────────────────
 
 def db_reaction_cooldown_ok(guild_id: int, user_id: int, cooldown_hours: int) -> tuple:
@@ -942,11 +1106,33 @@ def db_get_daily_quests(guild_id: int, user_id: int, date_key: str) -> list:
     return [dict(r) for r in rows]
 
 def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: int = 3) -> list:
-    """Pick `count` random daily quests for this user if none exist yet. Returns quest list."""
+    """Pick `count` random daily quests for this user if none exist yet.
+
+    Rules:
+    - Quests in the same exclusive group (e.g. position quests dq_first1/3/5)
+      are mutually exclusive — only ONE from each group is ever assigned.
+    - This prevents logically redundant combos such as "be first" + "be in top 5".
+    Returns the assigned quest list.
+    """
     existing = db_get_daily_quests(guild_id, user_id, date_key)
     if existing:
         return existing
-    chosen = _random.sample(DAILY_QUEST_POOL, min(count, len(DAILY_QUEST_POOL)))
+
+    # Build a de-grouped pool: keep at most one representative per exclusive group
+    pool = list(DAILY_QUEST_POOL)
+    chosen: list = []
+    used_groups: set = set()
+    _random.shuffle(pool)
+    for q in pool:
+        if len(chosen) >= count:
+            break
+        grp = q.get("group")
+        if grp and grp in used_groups:
+            continue  # skip — another quest from this group is already chosen
+        chosen.append(q)
+        if grp:
+            used_groups.add(grp)
+
     conn = get_db()
     for q in chosen:
         target = q["target"]
@@ -963,7 +1149,7 @@ def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: in
             dq_cfg    = db_get_config(guild_id)
             owner_uid = dq_cfg.get("meeple_owner_user_id")
             owner_str = f"<@{owner_uid}>" if owner_uid else "**404ERROR** *(set an owner in /config → Daily Quests)*"
-            name      = f"Get a gems bonus from {owner_str} (ping them to ask!)"
+            name      = f"Get a gems bonus from {owner_str} (ping him to ask!)"
         conn.execute(
             "INSERT OR IGNORE INTO daily_quests "
             "(guild_id, user_id, date_key, quest_key, quest_type, quest_target, quest_name) "
@@ -1617,7 +1803,7 @@ def parse_channel_id(value: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 def parse_user_id(value: str) -> Optional[int]:
-    m = re.search(r'<@!?(\d+)>', value) or re.search(r'^(\d{17,20})$', value.strip())
+    m = re.search(r'<@!?(\d+)>', value) or re.search(r'(\d{17,20})', value)
     return int(m.group(1)) if m else None
 
 def parse_role_id(value: str) -> Optional[int]:
@@ -2364,9 +2550,16 @@ def make_info_embed(guild: discord.Guild, config: dict) -> discord.Embed:
         value=f"Complete quests each month to earn between **{cur(config, q_stone)}** (Stone) and **{cur(config, q_diamond)}** (Diamond).\nUse `/quests` in {ch_quest} to check your progress.",
         inline=False
     )
+    if config.get("daily_quest_enabled"):
+        daily_xp = config.get("daily_quest_xp", 50)
+        e.add_field(
+            name="🗓️ Daily Quests",
+            value=f"3 new quests every day — complete them to earn **+{cur(config, daily_xp)}** each.\nUse `/quests` to see today's list.",
+            inline=False
+        )
     e.add_field(
         name=f"🛒 What can you do with {c_emoji} {c_name}?",
-        value=f"Spend your {c_name} in `/shop` (use it in {ch_shop}) to unlock **exclusive rewards** — pins, skins, friend requests, and more.",
+        value=f"Spend your {c_name} in `/shop` (use it in {ch_shop}) to unlock exclusive rewards — pins, skins, friend requests, and more.",
         inline=False
     )
     e.add_field(
@@ -2778,15 +2971,20 @@ class ConfigChannelsMenu(_SubMenu):
                 if not value.strip():
                     db_set_config(self.guild.id, **{config_key: None})
                     await inter.response.send_message("✅ Channel removed.", ephemeral=True)
-                    await self._refresh(interaction)
-                    return
-                ch_id = parse_channel_id(value)
-                if not ch_id:
-                    await inter.response.send_message("❌ Invalid channel.", ephemeral=True)
-                    return
-                db_set_config(self.guild.id, **{config_key: ch_id})
-                await inter.response.send_message(f"✅ Set to <#{ch_id}>", ephemeral=True)
-                await self._refresh(interaction)
+                else:
+                    ch_id = parse_channel_id(value)
+                    if not ch_id:
+                        await inter.response.send_message("❌ Invalid channel.", ephemeral=True)
+                        return
+                    db_set_config(self.guild.id, **{config_key: ch_id})
+                    await inter.response.send_message(f"✅ Set to <#{ch_id}>", ephemeral=True)
+                # Refresh the panel via the original button's message (modal token
+                # cannot edit_original_response on a message — only on the modal itself)
+                try:
+                    await interaction.message.edit(
+                        embed=self.build_embed(db_get_config(self.guild.id)), view=self)
+                except Exception:
+                    pass
             await interaction.response.send_modal(Modal1(
                 title=title, label="Channel mention or ID (empty = remove)",
                 placeholder="#channel  or  1234567890",
@@ -2922,7 +3120,7 @@ class ConfigChannelsMenu(_SubMenu):
             required=False, callback=submit
         ))
 
-    @discord.ui.button(label="Info Channel",         style=discord.ButtonStyle.blurple, row=3)
+    @discord.ui.button(label="Info Channel",         style=discord.ButtonStyle.blurple, row=2)
     async def btn_info_ch(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
         async def submit(inter, value):
@@ -2982,6 +3180,14 @@ class ConfigDMsMenu(_SubMenu):
         e.add_field(name="🔕 Notif Prompt Cooldown",    value=f"**{notif_label}**", inline=True)
         bulk_dm_role = config.get("bulk_dm_role_id")
         e.add_field(name="📨 Bulk DM Role",              value=_role(bulk_dm_role) if bulk_dm_role else "`Not set`", inline=True)
+        e.add_field(name="\u200b", value="─────────────────────────", inline=False)
+        give_enabled = config.get("give_enabled", 0)
+        give_max     = config.get("give_max_daily", 100)
+        give_recv    = config.get("give_receive_cooldown_h", 1)
+        c_name = config.get("currency_name") or "Gems"
+        e.add_field(name="🎁 Gift Gems (/give)",         value=_on(give_enabled), inline=True)
+        e.add_field(name="🎁 Max Gift/Day",              value=f"**{give_max} {c_name}**", inline=True)
+        e.add_field(name="🎁 Recv Limit/Day",            value=f"**{give_recv} gift(s)**", inline=True)
         e.add_field(name="\u200b", value=(
             "**Welcome DM** — bot DMs new members when they join\n"
             "**DM Role Filter** — (unused on join, only for reference)\n"
@@ -2992,7 +3198,8 @@ class ConfigDMsMenu(_SubMenu):
             "**Purchase DM** — enable/disable DM notifications when a purchase ticket opens\n"
             "**Purchase DM Role** — role that receives purchase DMs (default: Meeple Owner)\n"
             "**Notif Prompt Cooldown** — days before the 🔔 notification prompt reappears after 'Later'\n"
-            "**Bulk DM Role** — role whose members receive the welcome DM when you press **📨 Send DMs** below"
+            "**Bulk DM Role** — role whose members receive the welcome DM when you press **📨 Send DMs** below\n"
+            "**Gift Gems** — /give command: members can gift gems; requires ≥ 1000 gems to give"
         ), inline=False)
         return e
 
@@ -3224,6 +3431,63 @@ class ConfigDMsMenu(_SubMenu):
             placeholder="@StoreManager  or  1234567890",
             default=str(config.get("purchase_dm_role_id") or ""),
             required=False, callback=submit
+        ))
+
+    @discord.ui.button(label="🎁 Toggle Gift Gems",      style=discord.ButtonStyle.blurple, row=3)
+    async def btn_gift_toggle(self, interaction: discord.Interaction, btn):
+        """Enable or disable the /give command for this server."""
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("give_enabled", 0) else 1
+        db_set_config(self.guild.id, give_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Gift gems (/give) {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="🎁 Max Gift/Day",          style=discord.ButtonStyle.grey,    row=3)
+    async def btn_gift_max(self, interaction: discord.Interaction, btn):
+        """Set the maximum gems a member can give per day."""
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                v = int(value.strip())
+                if v <= 0: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a positive number.", ephemeral=True)
+                return
+            db_set_config(self.guild.id, give_max_daily=v)
+            cfg2 = db_get_config(self.guild.id)
+            await inter.response.send_message(
+                f"✅ Max gift per day set to **{cur(cfg2, v)}**.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Max Gift Per Day",
+            label="Max gems any member can give per day",
+            placeholder="100",
+            default=str(config.get("give_max_daily", 100)),
+            callback=submit
+        ))
+
+    @discord.ui.button(label="🎁 Receive Limit/Day",     style=discord.ButtonStyle.grey,    row=3)
+    async def btn_gift_recv(self, interaction: discord.Interaction, btn):
+        """Set how many gifts a member can receive per day (typically 1)."""
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                v = int(value.strip())
+                if v < 1: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a number ≥ 1.", ephemeral=True)
+                return
+            db_set_config(self.guild.id, give_receive_cooldown_h=v)
+            await inter.response.send_message(
+                f"✅ Members can receive at most **{v}** gift(s) per day.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Gift Receive Limit",
+            label="Max gifts a member can receive per day",
+            placeholder="1",
+            default=str(config.get("give_receive_cooldown_h", 1)),
+            callback=submit
         ))
 
     @discord.ui.button(label="📨 Send DMs",              style=discord.ButtonStyle.green,   row=4)
@@ -4511,11 +4775,174 @@ class ConfigShopMenu(_SubMenu):
             if i.get("is_temporary"): tags.append(f"⏳{i['duration_days']}d")
             if i.get("requires_text"): tags.append(f"📝 {i['text_label']}")
             if i.get("image_url"): tags.append("🖼️")
+            if i.get("requires_approval"): tags.append("🔒")
+            if i.get("purchase_limit"): tags.append(f"🔢{i['purchase_limit']}")
             tag_str = "  " + "  ".join(tags) if tags else ""
             config = db_get_config(self.guild.id)
             lines.append(f"`{i['id']}` **{i['name']}** — {cur(config, i['price'])}{tag_str}")
         e = E("🛒 All Shop Items", "\n".join(lines), C_GOLD)
+        e.set_footer(text="🖼️=image  ⏳=temp  📝=text  🔒=approval  🔢N=buy limit")
         await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="🔒 Require Approval", style=discord.ButtonStyle.grey, row=3)
+    async def btn_toggle_approval(self, interaction: discord.Interaction, btn):
+        """Toggle whether an item requires Gems Owner approval before purchase."""
+        all_items = db_get_shop_items(self.guild.id)
+        if not all_items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{item['name'][:70]}  —  {cur(config, item['price'])}",
+                description="🔒 Approval REQUIRED" if item.get("requires_approval") else "🟢 Instant purchase",
+                value=str(item["id"])
+            )
+            for item in all_items[:25]
+        ]
+        view = discord.ui.View(timeout=60)
+        sel  = discord.ui.Select(placeholder="Toggle approval requirement", options=options)
+        guild_ref = self.guild
+        parent    = interaction
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(sel.values[0])
+            chosen  = next((i for i in all_items if i["id"] == item_id), None)
+            if not chosen:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+            new_val = 0 if chosen.get("requires_approval") else 1
+            conn = get_db()
+            conn.execute("UPDATE shop_items SET requires_approval=? WHERE id=? AND guild_id=?",
+                         (new_val, item_id, guild_ref.id))
+            conn.commit()
+            conn.close()
+            label = "🔒 Approval now **required**" if new_val else "🟢 Item is now **instant purchase**"
+            await inter2.response.send_message(f"{label} for **{chosen['name']}**", ephemeral=True)
+            await self._refresh(parent)
+        sel.callback = on_select
+        view.add_item(sel)
+        await interaction.response.send_message(
+            "🔒 **Require Gems Owner approval** before a purchase goes through.\n"
+            "When enabled, gems are only deducted after an owner approves in the admin channel.",
+            view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="🔢 Buy Limit", style=discord.ButtonStyle.grey, row=3)
+    async def btn_buy_limit(self, interaction: discord.Interaction, btn):
+        """Set or clear a per-person purchase limit for an item."""
+        all_items = db_get_shop_items(self.guild.id)
+        if not all_items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{item['name'][:70]}  —  {cur(config, item['price'])}",
+                description=f"🔢 Limit: {item['purchase_limit']}/person" if item.get("purchase_limit") else "No limit",
+                value=str(item["id"])
+            )
+            for item in all_items[:25]
+        ]
+        view = discord.ui.View(timeout=60)
+        sel  = discord.ui.Select(placeholder="Set purchase limit for item", options=options)
+        guild_ref = self.guild
+        parent    = interaction
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(sel.values[0])
+            chosen  = next((i for i in all_items if i["id"] == item_id), None)
+            if not chosen:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+            async def limit_submit(inter3, value):
+                v = value.strip()
+                if not v or v == "0":
+                    conn = get_db()
+                    conn.execute("UPDATE shop_items SET purchase_limit=NULL WHERE id=? AND guild_id=?",
+                                 (item_id, guild_ref.id))
+                    conn.commit()
+                    conn.close()
+                    await inter3.response.send_message(
+                        f"✅ Purchase limit **removed** from **{chosen['name']}** — unlimited purchases.", ephemeral=True)
+                else:
+                    try:
+                        lim = int(v)
+                        if lim < 1: raise ValueError
+                    except ValueError:
+                        await inter3.response.send_message("❌ Enter a positive number (or 0 to remove).", ephemeral=True)
+                        return
+                    conn = get_db()
+                    conn.execute("UPDATE shop_items SET purchase_limit=? WHERE id=? AND guild_id=?",
+                                 (lim, item_id, guild_ref.id))
+                    conn.commit()
+                    conn.close()
+                    await inter3.response.send_message(
+                        f"✅ **{chosen['name']}** limited to **{lim} purchase(s) per person**.", ephemeral=True)
+                await self._refresh(parent)
+            current_limit = str(chosen.get("purchase_limit") or "")
+            await inter2.response.send_modal(Modal1(
+                f"Buy Limit — {chosen['name'][:35]}",
+                label="Max purchases per person (0 = unlimited)",
+                placeholder="1  or  3  or  0",
+                default=current_limit,
+                required=False,
+                callback=limit_submit
+            ))
+        sel.callback = on_select
+        view.add_item(sel)
+        await interaction.response.send_message(
+            "🔢 **Set a per-person purchase limit.**\n"
+            "Members who reach this limit will be blocked from buying again.\n"
+            "Set to 0 to remove the limit.",
+            view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="👁️ Hide Buy Limit", style=discord.ButtonStyle.grey, row=3)
+    async def btn_hide_limit(self, interaction: discord.Interaction, btn):
+        """Toggle whether the purchase limit counter is shown in /shop."""
+        all_items = [i for i in db_get_shop_items(self.guild.id) if i.get("purchase_limit")]
+        if not all_items:
+            await interaction.response.send_message("❌ No items have a purchase limit set.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{item['name'][:70]}  —  {cur(config, item['price'])}",
+                description="👁️ Limit SHOWN in /shop" if item.get("show_purchase_limit", 1) else "🔇 Limit HIDDEN",
+                value=str(item["id"])
+            )
+            for item in all_items[:25]
+        ]
+        view = discord.ui.View(timeout=60)
+        sel  = discord.ui.Select(placeholder="Toggle buy limit visibility", options=options)
+        guild_ref = self.guild
+        parent    = interaction
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(sel.values[0])
+            chosen  = next((i for i in all_items if i["id"] == item_id), None)
+            if not chosen:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+            new_show = 0 if chosen.get("show_purchase_limit", 1) else 1
+            conn = get_db()
+            conn.execute("UPDATE shop_items SET show_purchase_limit=? WHERE id=? AND guild_id=?",
+                         (new_show, item_id, guild_ref.id))
+            conn.commit()
+            conn.close()
+            label = "👁️ Buy limit now **shown** in /shop" if new_show else "🔇 Buy limit now **hidden** from /shop"
+            await inter2.response.send_message(f"{label} for **{chosen['name']}**", ephemeral=True)
+            await self._refresh(parent)
+        sel.callback = on_select
+        view.add_item(sel)
+        await interaction.response.send_message("👁️ Toggle buy limit display:", view=view, ephemeral=True)
 
 class ConfigQuestsMenu(_SubMenu):
     def build_embed(self, config: dict) -> discord.Embed:
@@ -5321,26 +5748,23 @@ class AdminXPMenu(discord.ui.View):
             if guild:
                 await update_streak_nickname(guild, uid, 0)
             await inter.response.send_message(f"✅ <@{uid}>'s streak reset to 0.", ephemeral=True)
+            await send_log(inter.client, self.guild.id, inter.user, "Streak Reset",
+                           f"<@{uid}> → 🔥0")
         await interaction.response.send_modal(Modal1("Reset Member Streak", "Member mention or ID",
             placeholder="@username  or  1234567890", callback=submit))
 
     @discord.ui.button(label="➕ Modify Streak",  style=discord.ButtonStyle.grey,   row=2)
     async def btn_modify_streak(self, interaction: discord.Interaction, btn):
         """Add or remove streak days for a member (e.g. +3 or -2)."""
-        async def submit(inter, value):
-            parts = value.strip().split()
-            if len(parts) < 2:
-                await inter.response.send_message(
-                    "❌ Format: `@user +3`  or  `@user -2`  (mention or ID, then change)", ephemeral=True)
-                return
-            uid = parse_user_id(parts[0])
-            try:
-                delta = int(parts[1])
-            except ValueError:
-                await inter.response.send_message("❌ Invalid number.", ephemeral=True)
-                return
+        async def submit(inter, user_val, delta_val):
+            uid = parse_user_id(user_val.strip())
             if not uid:
-                await inter.response.send_message("❌ Invalid member.", ephemeral=True)
+                await inter.response.send_message("❌ Invalid member — enter a mention or numeric ID.", ephemeral=True)
+                return
+            try:
+                delta = int(delta_val.strip())
+            except ValueError:
+                await inter.response.send_message("❌ Invalid number — use e.g. `+3` or `-2`.", ephemeral=True)
                 return
             streak = db_get_streak(self.guild.id, uid)
             new_streak = max(0, streak["current_streak"] + delta)
@@ -5351,11 +5775,18 @@ class AdminXPMenu(discord.ui.View):
             sign = "+" if delta >= 0 else ""
             await inter.response.send_message(
                 f"✅ <@{uid}>'s streak {sign}{delta} → **🔥{new_streak}**.", ephemeral=True)
-        await interaction.response.send_modal(Modal1(
-            "Modify Member Streak",
-            "Member mention/ID then change (e.g.  @user +3)",
-            placeholder="@username +3",
-            callback=submit))
+            await send_log(inter.client, self.guild.id, inter.user, "Streak Modified",
+                           f"<@{uid}> : {sign}{delta} → 🔥{new_streak}")
+        try:
+            await interaction.response.send_modal(Modal2(
+                "Modify Member Streak",
+                "Member mention or ID", "e.g. @username  or  1234567890123456789",
+                "Streak change", "e.g. +3  or  -2",
+                callback=submit))
+        except Exception as e:
+            print(f"[btn_modify_streak] {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Could not open the form. Please try again.", ephemeral=True)
 
     @discord.ui.button(label="🎲 Reroll Quests",  style=discord.ButtonStyle.grey,   row=2)
     async def btn_reroll_quests(self, interaction: discord.Interaction, btn):
@@ -5702,6 +6133,127 @@ async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: dis
     return ticket_ch
 
 
+class PendingPurchaseView(discord.ui.View):
+    """Approve or reject a pending shop purchase requiring Gems Owner sign-off.
+
+    Sent to the admin channel when a member tries to buy an item with
+    requires_approval=1.  Gems are NOT deducted until a Gems Owner approves.
+    """
+
+    def __init__(self, purchase_id: int, guild: discord.Guild,
+                 buyer: discord.Member, shop_item: dict,
+                 item_text: Optional[str], bot_ref):
+        super().__init__(timeout=None)   # stays active until clicked
+        self.purchase_id = purchase_id
+        self.guild       = guild
+        self.buyer       = buyer
+        self.shop_item   = shop_item
+        self.item_text   = item_text
+        self.bot_ref     = bot_ref
+        self._resolved   = False
+
+    async def _resolve(self, interaction: discord.Interaction, approved: bool):
+        if self._resolved:
+            await interaction.response.send_message("⚠️ Already resolved.", ephemeral=True)
+            return
+        config   = db_get_config(self.guild.id)
+        purchase = db_get_pending_purchase(self.purchase_id)
+        if not purchase or purchase["status"] != "pending":
+            await interaction.response.send_message("⚠️ Purchase already resolved.", ephemeral=True)
+            return
+        self._resolved = True
+        resolver = interaction.user
+
+        if approved:
+            # Deduct gems and add to inventory
+            buyer_bal = db_get_xp(self.guild.id, self.buyer.id)
+            if buyer_bal < self.shop_item["price"]:
+                await interaction.response.send_message(
+                    f"❌ Cannot approve — {self.buyer.mention} no longer has enough "
+                    f"{cur(config)} (has **{buyer_bal}**, needs **{self.shop_item['price']}**).",
+                    ephemeral=True
+                )
+                self._resolved = False
+                return
+            new_bal = db_add_xp(self.guild.id, self.buyer.id, -self.shop_item["price"])
+            db_decrement_stock(self.shop_item["id"], self.guild.id)
+            expires_at = None
+            if self.shop_item.get("is_temporary") and self.shop_item.get("duration_days"):
+                expires_at = (datetime.now() + timedelta(days=self.shop_item["duration_days"])).isoformat()
+            db_add_inventory(self.guild.id, self.buyer.id, self.shop_item["name"], expires_at, self.item_text)
+            db_resolve_pending_purchase(self.purchase_id, "approved", resolver.id)
+
+            # Create ticket
+            ticket_ch = await _create_purchase_ticket(
+                self.bot_ref, self.guild, self.buyer, self.shop_item, self.item_text
+            )
+            # DM buyer
+            try:
+                dm_msg = (
+                    f"✅ Your purchase of **{self.shop_item['name']}** in **{self.guild.name}** "
+                    f"has been **approved** by {resolver.mention}!\n"
+                    f"Remaining balance: **{cur(config, new_bal)}**"
+                )
+                if ticket_ch:
+                    dm_msg += f"\n🎫 Ticket opened: {ticket_ch.mention}"
+                await self.buyer.send(dm_msg)
+            except Exception:
+                pass
+            await interaction.response.send_message(
+                f"✅ Purchase approved for {self.buyer.mention}. "
+                f"Ticket: {ticket_ch.mention if ticket_ch else '(could not create)'}",
+                ephemeral=True
+            )
+            await bot_log(self.bot_ref, self.guild.id, "✅ Purchase Approved",
+                          f"**Item:** {self.shop_item['name']}\n"
+                          f"**Buyer:** {self.buyer.mention}\n"
+                          f"**Approved by:** {resolver.mention}", C_SUCCESS)
+        else:
+            db_resolve_pending_purchase(self.purchase_id, "rejected", resolver.id)
+            # DM buyer
+            try:
+                await self.buyer.send(
+                    f"❌ Your purchase request for **{self.shop_item['name']}** in "
+                    f"**{self.guild.name}** was **rejected** by a Gems Owner.\n"
+                    f"Your gems were not deducted. Contact them if you have questions."
+                )
+            except Exception:
+                pass
+            await interaction.response.send_message(
+                f"❌ Purchase rejected for {self.buyer.mention}. No gems were deducted.",
+                ephemeral=True
+            )
+            await bot_log(self.bot_ref, self.guild.id, "❌ Purchase Rejected",
+                          f"**Item:** {self.shop_item['name']}\n"
+                          f"**Buyer:** {self.buyer.mention}\n"
+                          f"**Rejected by:** {resolver.mention}", C_ERROR)
+
+        # Disable buttons
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green)
+    async def approve(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        config = db_get_config(self.guild.id)
+        if not is_xp_manager(interaction.user, config):
+            await interaction.response.send_message("❌ Only Gems Owners can approve purchases.", ephemeral=True)
+            return
+        await self._resolve(interaction, approved=True)
+
+    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.red)
+    async def reject(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        config = db_get_config(self.guild.id)
+        if not is_xp_manager(interaction.user, config):
+            await interaction.response.send_message("❌ Only Gems Owners can reject purchases.", ephemeral=True)
+            return
+        await self._resolve(interaction, approved=False)
+
+
 class ShopView(discord.ui.View):
     """Member-facing paginated shop — one item per page.
 
@@ -5853,6 +6405,21 @@ class ShopView(discord.ui.View):
                     else:
                         ie.add_field(name="📦 Stock", value=f"**{stock_left}** remaining", inline=True)
 
+            # Per-person purchase limit display
+            pur_limit = item.get("purchase_limit")
+            if pur_limit and item.get("show_purchase_limit", 1):
+                already = db_count_user_purchases(item["name"], self.guild.id, self.user.id)
+                remaining_purchases = max(0, pur_limit - already)
+                ie.add_field(
+                    name="🔢 Purchase Limit",
+                    value=f"**{remaining_purchases}/{pur_limit}** remaining for you",
+                    inline=True
+                )
+
+            # Approval badge
+            if item.get("requires_approval"):
+                ie.add_field(name="🔒 Approval Required", value="A Gems Owner must approve this purchase", inline=True)
+
             out.append(ie)
         return out
 
@@ -5868,6 +6435,16 @@ class ShopView(discord.ui.View):
                     f"❌ Not enough {cur(config)}. Need **{item['price']}**, you have **{user_bal}**.",
                     ephemeral=True)
                 return
+            # ── Per-person purchase limit check ──────────────────
+            purchase_limit = item.get("purchase_limit")
+            if purchase_limit:
+                already_bought = db_count_user_purchases(item["name"], self.guild.id, self.user.id)
+                if already_bought >= purchase_limit:
+                    await interaction.response.send_message(
+                        f"❌ You've reached the purchase limit for **{item['name']}** "
+                        f"(**{purchase_limit}** max per person).",
+                        ephemeral=True)
+                    return
             # If item requires text, ask for it first
             if item.get("requires_text"):
                 async def text_submit(inter, value):
@@ -5910,6 +6487,67 @@ class ShopView(discord.ui.View):
                 else:
                     await inter.response.send_message(msg, ephemeral=True)
                 return
+
+            # ── Approval flow ─────────────────────────────────────
+            if fresh_item and fresh_item.get("requires_approval"):
+                # Don't deduct gems yet — create a pending record and wait for owner approval
+                purchase_id = db_add_pending_purchase(
+                    self.guild.id, self.user.id,
+                    shop_item["id"], shop_item["name"],
+                    shop_item["price"], item_text
+                )
+                # Notify admin channel
+                pending_embed = E(
+                    "🔔 Purchase Awaiting Approval",
+                    f"**Item:** {shop_item['name']}\n"
+                    f"**Buyer:** {self.user.mention} ({self.user.display_name})\n"
+                    f"**Price:** {cur(config, shop_item['price'])}"
+                    + (f"\n**Info provided:** {item_text}" if item_text else ""),
+                    C_GOLD
+                )
+                if shop_item.get("image_url"):
+                    pending_embed.set_thumbnail(url=shop_item["image_url"])
+                pending_embed.set_footer(text=f"Purchase ID: #{purchase_id} — use the buttons to approve or reject")
+                pv = PendingPurchaseView(
+                    purchase_id=purchase_id,
+                    guild=self.guild,
+                    buyer=self.user,
+                    shop_item=fresh_item,
+                    item_text=item_text,
+                    bot_ref=inter.client
+                )
+                manager_role_id = config.get("manager_role_id")
+                role_ping = f"<@&{manager_role_id}>" if manager_role_id else ""
+                await notify_admin(inter.client, self.guild.id,
+                                   content=role_ping,
+                                   embed=pending_embed)
+                # Also post view to admin channel so buttons appear there
+                admin_ch_id = config.get("admin_channel_id")
+                admin_ch = inter.client.get_channel(admin_ch_id) if admin_ch_id else None
+                if admin_ch:
+                    try:
+                        await admin_ch.send(view=pv)
+                    except Exception:
+                        pass
+                pending_msg = (
+                    f"⏳ Your purchase request for **{shop_item['name']}** has been submitted!\n"
+                    f"A Gems Owner will review it shortly. You'll receive a DM when it's approved or rejected.\n"
+                    f"*(Your gems will only be deducted if approved.)*"
+                )
+                if inter.response.is_done():
+                    await inter.followup.send(pending_msg, ephemeral=True)
+                else:
+                    await inter.response.send_message(pending_msg, ephemeral=True)
+                # Refresh shop
+                self.items = db_get_shop_items(self.guild.id)
+                self._build()
+                try:
+                    if inter.response.is_done():
+                        await inter.edit_original_response(embeds=self.embeds(), view=self)
+                except Exception:
+                    pass
+                return
+
             new_bal = db_add_xp(self.guild.id, self.user.id, -shop_item["price"])
             # Decrement limited stock
             db_decrement_stock(shop_item["id"], self.guild.id)
@@ -6130,6 +6768,10 @@ async def check_share_channel_lock():
         window_open = bool(deadline and deadline > now_ts)
         await _set_share_channel_lock(bot, guild_id, locked=not window_open)
 
+# In-memory set tracking (guild_id, video_id, user_id) streak reminder DMs already sent this window.
+# Prevents the 1-minute loop from DMing the same member multiple times.
+_streak_reminder_sent: set = set()
+
 @tasks.loop(minutes=1)
 async def check_streak_reminders():
     """DM members with an active streak who haven't shared the current video and have < 5 min left."""
@@ -6162,6 +6804,10 @@ async def check_streak_reminders():
             uid = s["user_id"]
             if db_has_shared(guild_id, video_id, uid):
                 continue
+            # Avoid DM spam: only send once per video per member across loop ticks
+            reminder_key = (guild_id, video_id, uid)
+            if reminder_key in _streak_reminder_sent:
+                continue
             member = guild.get_member(uid)
             if not member or member.bot:
                 continue
@@ -6171,6 +6817,7 @@ async def check_streak_reminders():
                     f"You have less than 5 minutes to share the video — <t:{deadline}:R>\n"
                     f"Go share it now to keep your streak alive!"
                 )
+                _streak_reminder_sent.add(reminder_key)
             except discord.Forbidden:
                 pass
     conn.close()
@@ -6215,14 +6862,17 @@ async def check_daily_quests():
             conn2.close()
             if already_sent:
                 continue
+            cfg_q  = db_get_config(guild_id)
+            c_emoji = cfg_q.get("currency_emoji", "💎")
             lines = []
             for q in quests:
-                lines.append(f"• **{q['quest_name']}** — reward: {quest_xp} {db_get_config(guild_id).get('currency_emoji','💎')}")
+                lines.append(f"• {q['quest_name']} — {quest_xp} {c_emoji}")
             try:
                 await member.send(
-                    f"📋 **Daily Quests for {date_key}** — {guild.name}\n\n" +
-                    "\n".join(lines) +
-                    f"\n\nComplete these today to earn your rewards! Good luck 🍀"
+                    f"🗓️ Daily Quests — {guild.name} ({date_key})\n\n"
+                    + "\n".join(lines)
+                    + f"\n\nComplete them today to earn your rewards!\n"
+                    f"Use /quests to track your progress. Good luck 🍀"
                 )
                 conn3 = get_db()
                 conn3.execute(
@@ -6293,11 +6943,16 @@ async def send_daily_shop():
                 ie.set_footer(text=f"Provided by {item['provided_by']}")
             embeds.append(ie)
         # Discord allows up to 10 embeds per message
+        posted = False
         for i in range(0, len(embeds), 10):
             try:
                 await ch.send(embeds=embeds[i:i+10])
+                posted = True
             except Exception as ex:
                 print(f"[DailyShop] Error posting for guild {guild_id}: {ex}")
+        if posted:
+            await bot_log(bot, guild_id, "🛍️ Daily Shop Posted",
+                          f"**Channel:** <#{ch_id}>\n**Items:** {len(items)}")
 
 @send_daily_shop.before_loop
 async def before_daily_shop():
@@ -6364,6 +7019,8 @@ async def send_revive_ping_button():
                 )
                 conn3.commit()
                 conn3.close()
+                await bot_log(bot, guild_id, "🔔 Revive Ping Sent",
+                              f"**Channel:** <#{ch_id}>\n**Date:** {date_key}")
                 sent = True
                 break
             except Exception:
@@ -6524,6 +7181,11 @@ async def on_member_join(member: discord.Member):
                 db_cache_invites(guild_id, current_invites)
     except Exception as e:
         print(f"[Invite] Error on member join: {e}")
+
+    # ── Log member join ─────────────────────────────────────────
+    await bot_log(bot, guild_id, "👋 Member Joined",
+                  f"**Member:** {member.mention} ({member.display_name})\n"
+                  f"**Account created:** <t:{int(member.created_at.timestamp())}:R>")
 
     # ── Welcome DM (on join) ────────────────────────────────────
     config = db_get_config(guild_id)
@@ -6737,48 +7399,104 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     def _norm_emoji(s: str) -> str:
         return s.replace("\ufe0f", "").replace("\ufe0e", "")
     if _norm_emoji(emoji_str) == _norm_emoji(cancel_emoji) and is_xp_manager(actor, config):
-        existing = db_get_reaction_msg(payload.guild_id, payload.message_id)
+        existing   = db_get_reaction_msg(payload.guild_id, payload.message_id)
+        share_rec  = db_get_share_log(payload.guild_id, payload.message_id)
+        config_r   = db_get_config(payload.guild_id)
+        channel    = bot.get_channel(payload.channel_id)
+
+        # Fetch the message to find the author (needed for DM + streak revert)
+        target_member = None
+        if channel:
+            try:
+                fetched_msg = await channel.fetch_message(payload.message_id)
+                if fetched_msg and not fetched_msg.author.bot:
+                    target_member = guild.get_member(fetched_msg.author.id) or fetched_msg.author
+            except Exception:
+                pass
+
+        react_amount = 0
+        share_amount = 0
+        streak_before_rev = 0
+
+        # ── 1. Cancel the ✅ reaction bonus if it was already given ──
         if existing and not existing.get("cancelled"):
-            target_id = existing["target_uid"]
-            amount    = existing["amount"]
-            # Remove gems only if amount > 0 (won't double-deduct pre-blocked rows)
-            if amount > 0:
-                new_xp = db_add_xp(payload.guild_id, target_id, -amount)
-            else:
-                new_xp = db_get_xp(payload.guild_id, target_id)
-            # Mark cancelled so ✅ cannot re-give on this message
+            t_id = existing["target_uid"]
+            react_amount = existing.get("amount", 0)
+            if react_amount > 0:
+                db_add_xp(payload.guild_id, t_id, -react_amount)
             db_cancel_reaction_msg(payload.guild_id, payload.message_id)
-            config_r = db_get_config(payload.guild_id)
-            channel = bot.get_channel(payload.channel_id)
-            if channel and amount > 0:
-                try:
-                    await channel.send(
-                        f"❌ {config_r.get('currency_emoji', '💎')} Reward cancelled for <@{target_id}> — "
-                        f"**{cur(config_r, amount)}** removed. Balance: **{cur(config_r, new_xp)}**",
-                        delete_after=15)
-                except Exception:
-                    pass
-            target_member = guild.get_member(target_id)
-            if target_member and amount > 0:
-                try:
-                    await target_member.send(
-                        f"❌ **Your reward was cancelled** in **{guild.name}**.\n"
-                        f"Lost: **{cur(config_r, amount)}** — make sure your share clearly shows "
-                        f"your comment and the video link, then try again! 💪"
-                    )
-                except Exception:
-                    pass
+            if not target_member:
+                target_member = guild.get_member(t_id)
         elif not existing:
-            # No prior award: pre-block this message so ✅ cannot reward it later
+            # Pre-block so ✅ cannot give a bonus later
             db_block_reaction_msg(payload.guild_id, payload.message_id)
-            channel = bot.get_channel(payload.channel_id)
-            if channel:
+
+        # ── 2. Revert the share XP + streak if the share was validated ──
+        if share_rec and not share_rec.get("cancelled"):
+            t_id_s         = share_rec["user_id"]
+            share_amount   = share_rec.get("xp_given", 0)
+            streak_before_rev = share_rec.get("streak_before", 0)
+            if not target_member:
+                target_member = guild.get_member(t_id_s)
+            if share_amount > 0:
+                db_add_xp(payload.guild_id, t_id_s, -share_amount)
+            # Restore streak to its value before the share
+            db_update_streak(payload.guild_id, t_id_s, streak_before_rev,
+                             share_rec.get("video_id") or "")
+            await update_streak_nickname(guild, t_id_s, streak_before_rev)
+            # Remove the video_shares entry so the member can post again
+            db_remove_share(payload.guild_id, share_rec["video_id"], t_id_s)
+            db_cancel_share_log(payload.guild_id, payload.message_id)
+
+        total_removed  = react_amount + share_amount
+        streak_reverted = share_rec and not share_rec.get("cancelled")
+
+        # ── 3. Channel notification ──
+        if channel:
+            mention = target_member.mention if target_member else "(unknown)"
+            if total_removed > 0 or share_rec:
+                notif = f"❌ Share rejected for {mention}"
+                if total_removed > 0:
+                    notif += f" — **{cur(config_r, total_removed)}** removed"
+                if streak_reverted:
+                    notif += f" — streak reset to 🔥{streak_before_rev}"
+                notif += " — can retry with a new post."
+                try:
+                    await channel.send(notif, delete_after=20)
+                except Exception:
+                    pass
+            else:
                 try:
                     await channel.send(
-                        f"🚫 Message blocked — no {config.get('currency_emoji', '💎')} reward can be given for it.",
+                        f"🚫 Message blocked for {mention} — no reward can be assigned.",
                         delete_after=10)
                 except Exception:
                     pass
+
+        # ── 4. DM to the member ──
+        if target_member:
+            dm_lines = [f"❌ Your share was rejected in **{guild.name}**."]
+            if share_amount > 0:
+                dm_lines.append(f"**{cur(config_r, share_amount)}** were removed from your balance.")
+            if streak_reverted:
+                dm_lines.append(f"Your streak was reset to 🔥{streak_before_rev}.")
+            dm_lines.append(
+                "Make sure your screenshot clearly shows your comment on the video, "
+                "then repost and get it validated! 💪"
+            )
+            try:
+                await target_member.send("\n".join(dm_lines))
+            except Exception:
+                pass
+
+        # ── 5. Log ──
+        await bot_log(bot, payload.guild_id, "❌ Share Rejected",
+                      f"**Rejected by:** {actor.mention} ({actor.display_name})\n"
+                      f"**Member:** {target_member.mention if target_member else '(unknown)'}\n"
+                      + (f"**Removed:** {cur(config_r, total_removed)}\n" if total_removed else "")
+                      + (f"**Streak reset to:** 🔥{streak_before_rev}\n" if streak_reverted else "")
+                      + "**Retry:** allowed",
+                      C_ERROR)
         return
 
     # ── Reaction emoji: award gems to the message author ──
@@ -6849,11 +7567,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     mult_str = f" (×{mult})" if mult > 1 else ""
     config_r  = db_get_config(payload.guild_id)
     msg = (f"{config_r.get('currency_emoji', '💎')} {target.mention} received "
-           f"**+{cur(config_r, xp_to_give)}**{mult_str}! Total: **{cur(config_r, new_xp)}**")
+           f"**+{cur(config_r, xp_to_give)}**{mult_str} from {actor.mention}! "
+           f"Total: **{cur(config_r, new_xp)}**")
     if streak_updated:
         msg += f"\n🔥 Streak updated: **{streak_updated}**"
     try:
-        await channel.send(msg, delete_after=15)
+        await channel.send(msg)
     except Exception:
         pass
     await check_achievements(bot, payload.guild_id, target.id)
@@ -6897,18 +7616,21 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     # Mark cancelled instead of deleting — prevents re-give with ✅
     db_cancel_reaction_msg(payload.guild_id, payload.message_id)
     config_r2 = db_get_config(payload.guild_id)
-    # DM the member to explain that their bonus was revoked
     target_member = guild.get_member(target_id)
     if target_member:
         try:
             await target_member.send(
-                f"❌ **Your reward was revoked** in **{guild.name}**.\n"
-                f"The reaction bonus was removed — make sure your share clearly shows "
-                f"your comment and the video link.\n"
-                f"Lost: **{cur(config_r2, amount)}** — try again on the next video! 💪"
+                f"❌ Your reaction reward was removed in **{guild.name}**.\n"
+                f"Lost: **{cur(config_r2, amount)}** — make sure your share clearly shows "
+                f"your comment and the video link. Good luck on the next one! 💪"
             )
         except Exception:
             pass
+    await bot_log(bot, payload.guild_id, "↩️ Reaction Removed",
+                  f"**Member:** <@{target_id}>\n"
+                  f"**Removed by:** {actor.mention}\n"
+                  f"**Amount:** -{cur(config_r2, amount)}\n"
+                  f"**Balance:** {cur(config_r2, new_xp)}", C_ERROR)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -7053,6 +7775,7 @@ async def _handle_share(message: discord.Message, config: dict):
     share_xp_base = config.get("share_xp", 100)
 
     total_xp = int((share_xp_base + streak_bonus) * mult)
+    streak_before_val = streak_info["current_streak"]   # captured before update, for ❌ revert
     new_xp = db_add_xp(guild_id, message.author.id, total_xp)
 
     # Update streak
@@ -7060,6 +7783,10 @@ async def _handle_share(message: discord.Message, config: dict):
         max_streak = db_update_streak(guild_id, message.author.id, new_streak, video_id)
         db_update_max_streak_stat(guild_id, message.author.id, new_streak)
         await update_streak_nickname(message.guild, message.author.id, new_streak)
+
+    # Log the share reward so ❌ can fully revert it (XP + streak)
+    db_log_share(guild_id, message.id, message.author.id, video_id,
+                 total_xp, streak_before_val, new_streak)
 
     # Confirm to member
     parts = [f"✅ {message.author.mention} — **+{cur(config, total_xp)}**! Balance: **{cur(config, new_xp)}**"]
@@ -7763,6 +8490,111 @@ async def cmd_info(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=e)
     await _prompt_ping_role(interaction)
+
+@bot.tree.command(name="give", description="🎁 Gift gems to another member")
+@app_commands.describe(
+    member="The member to gift gems to",
+    amount="How many gems to give (max: your server's daily limit)"
+)
+async def cmd_give(interaction: discord.Interaction, member: discord.Member, amount: int):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Server only.", ephemeral=True)
+        return
+    config = db_get_config(interaction.guild_id)
+    if not config.get("give_enabled", 0):
+        await interaction.response.send_message(
+            "❌ The gift gems feature is not enabled on this server.", ephemeral=True)
+        return
+    if not await _check_commands_channel(interaction):
+        return
+    sender = interaction.user
+    if sender.id == member.id:
+        await interaction.response.send_message("❌ You can't gift gems to yourself.", ephemeral=True)
+        return
+    if member.bot:
+        await interaction.response.send_message("❌ Bots can't receive gems.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        return
+
+    give_max    = config.get("give_max_daily", 100)
+    recv_limit  = config.get("give_receive_cooldown_h", 1)  # stored as "max per day"
+    min_balance = 1000  # anti-alt-account minimum — sender must have ≥ 1000 gems
+
+    sender_bal = db_get_xp(interaction.guild_id, sender.id)
+    if sender_bal < min_balance:
+        await interaction.response.send_message(
+            f"❌ You need at least **{cur(config, min_balance)}** to give gems "
+            f"(anti-alt protection). You have **{cur(config, sender_bal)}**.",
+            ephemeral=True
+        )
+        return
+
+    already_sent = db_gifts_sent_today(interaction.guild_id, sender.id)
+    if already_sent + amount > give_max:
+        remaining_today = max(0, give_max - already_sent)
+        await interaction.response.send_message(
+            f"❌ Daily gift limit: **{cur(config, give_max)}**.\n"
+            f"You've already sent **{cur(config, already_sent)}** today — "
+            f"you can still give **{cur(config, remaining_today)}** more.",
+            ephemeral=True
+        )
+        return
+
+    recv_today = db_gifts_received_today(interaction.guild_id, member.id)
+    if recv_today >= recv_limit:
+        await interaction.response.send_message(
+            f"❌ **{member.display_name}** has already received their maximum of "
+            f"**{recv_limit}** gift(s) today. Try again tomorrow!",
+            ephemeral=True
+        )
+        return
+
+    if sender_bal < amount:
+        await interaction.response.send_message(
+            f"❌ Not enough {cur(config)}. You have **{cur(config, sender_bal)}** "
+            f"but want to give **{cur(config, amount)}**.",
+            ephemeral=True
+        )
+        return
+
+    # Confirm
+    view = ConfirmView(sender.id)
+    await interaction.response.send_message(
+        f"🎁 Gift **{cur(config, amount)}** to {member.mention}?\n"
+        f"Your balance after: **{cur(config, sender_bal - amount)}**",
+        view=view, ephemeral=True
+    )
+    await view.wait()
+    if not view.value:
+        await interaction.followup.send("❌ Gift cancelled.", ephemeral=True)
+        return
+
+    # Execute
+    db_add_xp(interaction.guild_id, sender.id, -amount)
+    new_recv_bal = db_add_xp(interaction.guild_id, member.id, amount)
+    db_record_gift(interaction.guild_id, sender.id, member.id, amount)
+
+    await interaction.followup.send(
+        f"✅ You gifted **{cur(config, amount)}** to {member.mention}!", ephemeral=True
+    )
+
+    # DM recipient
+    try:
+        await member.send(
+            f"🎁 **{sender.display_name}** gifted you **{cur(config, amount)}** in **{interaction.guild.name}**!\n"
+            f"Your new balance: **{cur(config, new_recv_bal)}**"
+        )
+    except Exception:
+        pass
+
+    await bot_log(bot, interaction.guild_id, "🎁 Gems Gift",
+                  f"**From:** {sender.mention} ({sender.display_name})\n"
+                  f"**To:** {member.mention} ({member.display_name})\n"
+                  f"**Amount:** {cur(config, amount)}\n"
+                  f"**Recipient balance:** {cur(config, new_recv_bal)}", C_SUCCESS)
+
 
 # ── Error handler ─────────────────────────────────────────────
 
