@@ -3397,7 +3397,7 @@ class ConfigDMsMenu(_SubMenu):
             required=False, callback=submit
         ))
 
-    @discord.ui.button(label="Toggle Purchase DM",       style=discord.ButtonStyle.blurple, row=3)
+    @discord.ui.button(label="Toggle Purchase DM",       style=discord.ButtonStyle.blurple, row=2)
     async def btn_toggle_purchase_dm(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
         new_val = 0 if config.get("purchase_dm_enabled", 1) else 1
@@ -3409,7 +3409,7 @@ class ConfigDMsMenu(_SubMenu):
             ephemeral=True)
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Purchase DM Role",         style=discord.ButtonStyle.grey,    row=3)
+    @discord.ui.button(label="Purchase DM Role",         style=discord.ButtonStyle.grey,    row=2)
     async def btn_purchase_dm_role(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
         async def submit(inter, value):
@@ -3433,7 +3433,7 @@ class ConfigDMsMenu(_SubMenu):
             required=False, callback=submit
         ))
 
-    @discord.ui.button(label="🎁 Toggle Gift Gems",      style=discord.ButtonStyle.blurple, row=3)
+    @discord.ui.button(label="🎁 Toggle Gift (/give)",   style=discord.ButtonStyle.blurple, row=3)
     async def btn_gift_toggle(self, interaction: discord.Interaction, btn):
         """Enable or disable the /give command for this server."""
         config  = db_get_config(self.guild.id)
@@ -4567,8 +4567,9 @@ class ConfigShopMenu(_SubMenu):
                     ephemeral=True
                 )
                 await self._refresh(parent)
-            await inter2.response.send_modal(Modal1(
-                f"Add Rewards — {item_name[:35]}",
+            title_str = f"Add Rewards — {item_name}"
+        await inter2.response.send_modal(Modal1(
+                title_str[:45],
                 "One reward per line (or space-sep.)",
                 placeholder="https://link1.com\nhttps://link2.com\nCODE-ABC",
                 required=True, max_length=4000, paragraph=True, callback=rewards_submit
@@ -8491,11 +8492,43 @@ async def cmd_info(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e)
     await _prompt_ping_role(interaction)
 
+async def _give_amount_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[int]]:
+    """Show sender's balance, daily limit, and already-sent amount while typing /give amount."""
+    if not interaction.guild_id:
+        return []
+    try:
+        config       = db_get_config(interaction.guild_id)
+        give_max     = config.get("give_max_daily", 100)
+        already_sent = db_gifts_sent_today(interaction.guild_id, interaction.user.id)
+        remaining    = max(0, give_max - already_sent)
+        bal          = db_get_xp(interaction.guild_id, interaction.user.id)
+        c_name       = config.get("currency_name") or "Gems"
+
+        choices = []
+        if remaining == 0:
+            choices.append(app_commands.Choice(
+                name=f"Daily limit reached — already sent {already_sent} {c_name} today",
+                value=1))
+        else:
+            choices.append(app_commands.Choice(
+                name=f"Max today: {remaining} {c_name}  (balance: {bal}, sent: {already_sent}/{give_max})",
+                value=remaining))
+            for preset in [10, 25, 50, 100]:
+                if preset < remaining:
+                    choices.append(app_commands.Choice(
+                        name=f"{preset} {c_name}", value=preset))
+        return choices[:5]
+    except Exception:
+        return []
+
 @bot.tree.command(name="give", description="🎁 Gift gems to another member")
 @app_commands.describe(
     member="The member to gift gems to",
-    amount="How many gems to give (max: your server's daily limit)"
+    amount="How many gems to give — type to see your balance, daily limit, and how much you've already sent"
 )
+@app_commands.autocomplete(amount=_give_amount_autocomplete)
 async def cmd_give(interaction: discord.Interaction, member: discord.Member, amount: int):
     if not interaction.guild:
         await interaction.response.send_message("❌ Server only.", ephemeral=True)
