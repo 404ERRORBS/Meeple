@@ -121,15 +121,19 @@ QUEST_POOL = {
 
 # ── Daily quest pool — simple tasks achievable in one day ─────
 DAILY_QUEST_POOL = [
-    {"key": "dq_share_1",    "name": "Share today's video",                  "type": "dq_share",    "target": 1},
-    # Position quests — grouped so only ONE is assigned per day (see db_assign_daily_quests)
+    # Share quests — grouped with position so only ONE share-type task is assigned per day.
+    # A user can't have "Share today's video" AND "Be the first to share" simultaneously
+    # since both complete from the exact same action.
+    {"key": "dq_share_1",    "name": "Share today's video",                  "type": "dq_share",    "target": 1, "group": "position"},
     {"key": "dq_first5",     "name": "Be among the first 5 to share",        "type": "dq_first5",   "target": 1, "group": "position"},
     {"key": "dq_first3",     "name": "Be among the first 3 to share",        "type": "dq_first3",   "target": 1, "group": "position"},
     {"key": "dq_first1",     "name": "Be the very first to share",           "type": "dq_first1",   "target": 1, "group": "position"},
     {"key": "dq_invite",     "name": "Invite a new member",                  "type": "dq_invite",   "target": 1},
     {"key": "dq_check_gems", "name": "Check your balance with /gems",        "type": "dq_checkin",  "target": 1},
     {"key": "dq_share_top10","name": "Share and be in the top 10",           "type": "dq_top10",    "target": 1},
-    {"key": "dq_get_react",  "name": "Get a gems bonus from 404ERROR (ping him to ask!)", "type": "dq_get_react", "target": 1},
+    # dq_get_react: name is resolved at assignment time (see db_assign_daily_quests)
+    # ANY member with the Gems Owner role can trigger this — not only the designated owner.
+    {"key": "dq_get_react",  "name": "Get a gems bonus from a Gems Owner",   "type": "dq_get_react", "target": 1},
     # dq_messages: target and channel are resolved at assignment time
     {"key": "dq_messages",   "name": "Send {n} messages in the chat",        "type": "dq_messages", "target": 20},
 ]
@@ -1145,12 +1149,16 @@ def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: in
             msgs_ch_id = dq_cfg.get("daily_quest_messages_channel_id")
             ch_str     = f"<#{msgs_ch_id}>" if msgs_ch_id else "the chat"
             name       = f"Send {target} messages in {ch_str}"
-        # dq_get_react: show the configurable owner mention
+        # dq_get_react: ANY Gems Owner can award it — clarify this in the quest name.
+        # The designated owner (meeple_owner_user_id) is shown as a suggested person to ask,
+        # but completing the quest only requires a reaction from *any* member with the Gems Owner role.
         elif q["type"] == "dq_get_react":
             dq_cfg    = db_get_config(guild_id)
             owner_uid = dq_cfg.get("meeple_owner_user_id")
-            owner_str = f"<@{owner_uid}>" if owner_uid else "**404ERROR** *(set an owner in /config → Daily Quests)*"
-            name      = f"Get a gems bonus from {owner_str} (ping him to ask!)"
+            if owner_uid:
+                name = f"Get a gems bonus from a Gems Owner — ping <@{owner_uid}> to ask!"
+            else:
+                name = "Get a gems bonus from a Gems Owner (any member with the Gems Owner role)"
         conn.execute(
             "INSERT OR IGNORE INTO daily_quests "
             "(guild_id, user_id, date_key, quest_key, quest_type, quest_target, quest_name) "
@@ -2025,8 +2033,21 @@ async def process_daily_quest_completions(bot: commands.Bot, guild_id: int, user
     ch    = bot.get_channel(ch_id) if ch_id else None
 
     for quest_key in newly_done_keys:
-        quest_def  = next((q for q in DAILY_QUEST_POOL if q["key"] == quest_key), None)
-        quest_name = quest_def["name"] if quest_def else quest_key
+        # Use the name stored in the DB — it may be dynamic (e.g. dq_get_react has the real
+        # owner mention, dq_messages has the real channel mention and randomised count).
+        # Fall back to the static pool name, then to the raw key.
+        _conn_n = get_db()
+        _row_n  = _conn_n.execute(
+            "SELECT quest_name FROM daily_quests "
+            "WHERE guild_id=? AND user_id=? AND date_key=? AND quest_key=?",
+            (guild_id, user_id, date_key, quest_key)
+        ).fetchone()
+        _conn_n.close()
+        if _row_n and _row_n["quest_name"]:
+            quest_name = _row_n["quest_name"]
+        else:
+            quest_def  = next((q for q in DAILY_QUEST_POOL if q["key"] == quest_key), None)
+            quest_name = quest_def["name"] if quest_def else quest_key
 
         # Award XP (only if not already awarded for this quest)
         conn = get_db()
@@ -8445,11 +8466,8 @@ async def cmd_quests(interaction: discord.Interaction):
                 value=f"{status}\nReward: {reward_str}",
                 inline=False
             )
-        # Track "View your quests with /quests" daily quest
-        dq_done = db_daily_quest_progress(guild_id, user_id, date_key, "dq_checkq")
-        # Send first so the user sees the embed before the follow-up completion announce
+        # Send the embed first so the user sees it before any follow-up completion announce
         await interaction.response.send_message(embed=e)
-        await process_daily_quest_completions(bot, guild_id, user_id, dq_done, date_key)
     else:
         await interaction.response.send_message(embed=e)
     await _prompt_ping_role(interaction)
