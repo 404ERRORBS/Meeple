@@ -4589,7 +4589,7 @@ class ConfigShopMenu(_SubMenu):
                 )
                 await self._refresh(parent)
             title_str = f"Add Rewards — {item_name}"
-        await inter2.response.send_modal(Modal1(
+            await inter2.response.send_modal(Modal1(
                 title_str[:45],
                 "One reward per line (or space-sep.)",
                 placeholder="https://link1.com\nhttps://link2.com\nCODE-ABC",
@@ -4965,6 +4965,65 @@ class ConfigShopMenu(_SubMenu):
         sel.callback = on_select
         view.add_item(sel)
         await interaction.response.send_message("👁️ Toggle buy limit display:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="🔄 Post Shop Now", style=discord.ButtonStyle.green, row=3)
+    async def btn_post_shop(self, interaction: discord.Interaction, btn):
+        """Manually post the shop overview to the configured shop/daily-shop channel."""
+        await interaction.response.defer(ephemeral=True)
+        config  = db_get_config(self.guild.id)
+        items   = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.followup.send("❌ The shop is empty — add items first.", ephemeral=True)
+            return
+        # Prefer daily-shop channel, fall back to shop channel, then commands channel
+        ch_id = (config.get("daily_shop_channel_id")
+                 or config.get("shop_channel_id")
+                 or config.get("commands_channel_id"))
+        if not ch_id:
+            await interaction.followup.send(
+                "❌ No shop channel configured. Set one in `/config → 💬 Channels`.", ephemeral=True)
+            return
+        ch = interaction.client.get_channel(ch_id)
+        if not ch:
+            await interaction.followup.send(
+                f"❌ Cannot find channel <#{ch_id}>. Check bot permissions.", ephemeral=True)
+            return
+        c_name  = config.get("currency_name")  or "Gems"
+        c_emoji = config.get("currency_emoji") or "💎"
+        shop_ch = config.get("shop_channel_id") or config.get("commands_channel_id")
+        shop_ch_str = f"<#{shop_ch}>" if shop_ch else "the shop channel"
+        embeds = []
+        header = discord.Embed(
+            title="🛍️ Shop Update",
+            description=f"Here's what's available right now. Use `/shop` in {shop_ch_str} to buy!",
+            color=C_GOLD
+        )
+        header.timestamp = datetime.utcnow()
+        embeds.append(header)
+        for item in items:
+            stock_info = ""
+            if item.get("stock") is not None:
+                stock_info = " — **Sold out**" if item["stock"] == 0 else f" — **{item['stock']} left**"
+            line = f"{c_emoji} **{item['price']:,} {c_name}**{stock_info}"
+            ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
+            if item.get("image_url"):
+                ie.set_thumbnail(url=item["image_url"])
+            if item.get("provided_by"):
+                ie.set_footer(text=f"Provided by {item['provided_by']}")
+            embeds.append(ie)
+        try:
+            for i in range(0, len(embeds), 10):
+                await ch.send(embeds=embeds[i:i+10])
+            await interaction.followup.send(
+                f"✅ Shop posted to <#{ch_id}> — **{len(items)}** item(s).", ephemeral=True)
+            await bot_log(interaction.client, self.guild.id, "🔄 Shop Posted Manually",
+                          f"**By:** {interaction.user.mention}\n**Channel:** <#{ch_id}>\n**Items:** {len(items)}")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"❌ Missing permission to post in <#{ch_id}>.", ephemeral=True)
+        except Exception as ex:
+            await interaction.followup.send(f"❌ Error: {ex}", ephemeral=True)
+
 
 class ConfigQuestsMenu(_SubMenu):
     def build_embed(self, config: dict) -> discord.Embed:
