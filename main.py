@@ -476,6 +476,7 @@ def init_db():
         "ALTER TABLE guild_config ADD COLUMN give_max_daily INTEGER DEFAULT 100",
         "ALTER TABLE guild_config ADD COLUMN give_receive_cooldown_h INTEGER DEFAULT 24",
         "ALTER TABLE guild_config ADD COLUMN give_enabled INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN give_min_balance INTEGER DEFAULT 1000",
     ]:
         try:
             conn.execute(migration)
@@ -2781,6 +2782,11 @@ class ConfigMainMenu(discord.ui.View):
         sub = ConfigBoostAnnounceMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
+    @discord.ui.button(label="🎁 Gift Gems",   style=discord.ButtonStyle.blurple, row=2)
+    async def cat_gift(self, i, b):
+        sub = ConfigGiftMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
     @discord.ui.button(label="🔔 Revive Ping", style=discord.ButtonStyle.blurple, row=2)
     async def cat_revive_ping(self, i, b):
         sub = ConfigRevivePingMenu(self.guild, self.author_id)
@@ -3180,14 +3186,6 @@ class ConfigDMsMenu(_SubMenu):
         e.add_field(name="🔕 Notif Prompt Cooldown",    value=f"**{notif_label}**", inline=True)
         bulk_dm_role = config.get("bulk_dm_role_id")
         e.add_field(name="📨 Bulk DM Role",              value=_role(bulk_dm_role) if bulk_dm_role else "`Not set`", inline=True)
-        e.add_field(name="\u200b", value="─────────────────────────", inline=False)
-        give_enabled = config.get("give_enabled", 0)
-        give_max     = config.get("give_max_daily", 100)
-        give_recv    = config.get("give_receive_cooldown_h", 1)
-        c_name = config.get("currency_name") or "Gems"
-        e.add_field(name="🎁 Gift Gems (/give)",         value=_on(give_enabled), inline=True)
-        e.add_field(name="🎁 Max Gift/Day",              value=f"**{give_max} {c_name}**", inline=True)
-        e.add_field(name="🎁 Recv Limit/Day",            value=f"**{give_recv} gift(s)**", inline=True)
         e.add_field(name="\u200b", value=(
             "**Welcome DM** — bot DMs new members when they join\n"
             "**DM Role Filter** — (unused on join, only for reference)\n"
@@ -3199,7 +3197,7 @@ class ConfigDMsMenu(_SubMenu):
             "**Purchase DM Role** — role that receives purchase DMs (default: Meeple Owner)\n"
             "**Notif Prompt Cooldown** — days before the 🔔 notification prompt reappears after 'Later'\n"
             "**Bulk DM Role** — role whose members receive the welcome DM when you press **📨 Send DMs** below\n"
-            "**Gift Gems** — /give command: members can gift gems; requires ≥ 1000 gems to give"
+            "➡️ Gift Gems settings moved to **🎁 Gift Gems** in the main /config menu."
         ), inline=False)
         return e
 
@@ -3433,64 +3431,7 @@ class ConfigDMsMenu(_SubMenu):
             required=False, callback=submit
         ))
 
-    @discord.ui.button(label="🎁 Toggle Gift (/give)",   style=discord.ButtonStyle.blurple, row=3)
-    async def btn_gift_toggle(self, interaction: discord.Interaction, btn):
-        """Enable or disable the /give command for this server."""
-        config  = db_get_config(self.guild.id)
-        new_val = 0 if config.get("give_enabled", 0) else 1
-        db_set_config(self.guild.id, give_enabled=new_val)
-        await interaction.response.send_message(
-            f"✅ Gift gems (/give) {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
-        await self._refresh(interaction)
-
-    @discord.ui.button(label="🎁 Max Gift/Day",          style=discord.ButtonStyle.grey,    row=3)
-    async def btn_gift_max(self, interaction: discord.Interaction, btn):
-        """Set the maximum gems a member can give per day."""
-        config = db_get_config(self.guild.id)
-        async def submit(inter, value):
-            try:
-                v = int(value.strip())
-                if v <= 0: raise ValueError
-            except ValueError:
-                await inter.response.send_message("❌ Enter a positive number.", ephemeral=True)
-                return
-            db_set_config(self.guild.id, give_max_daily=v)
-            cfg2 = db_get_config(self.guild.id)
-            await inter.response.send_message(
-                f"✅ Max gift per day set to **{cur(cfg2, v)}**.", ephemeral=True)
-            await self._refresh(interaction)
-        await interaction.response.send_modal(Modal1(
-            "Max Gift Per Day",
-            label="Max gems any member can give per day",
-            placeholder="100",
-            default=str(config.get("give_max_daily", 100)),
-            callback=submit
-        ))
-
-    @discord.ui.button(label="🎁 Receive Limit/Day",     style=discord.ButtonStyle.grey,    row=3)
-    async def btn_gift_recv(self, interaction: discord.Interaction, btn):
-        """Set how many gifts a member can receive per day (typically 1)."""
-        config = db_get_config(self.guild.id)
-        async def submit(inter, value):
-            try:
-                v = int(value.strip())
-                if v < 1: raise ValueError
-            except ValueError:
-                await inter.response.send_message("❌ Enter a number ≥ 1.", ephemeral=True)
-                return
-            db_set_config(self.guild.id, give_receive_cooldown_h=v)
-            await inter.response.send_message(
-                f"✅ Members can receive at most **{v}** gift(s) per day.", ephemeral=True)
-            await self._refresh(interaction)
-        await interaction.response.send_modal(Modal1(
-            "Gift Receive Limit",
-            label="Max gifts a member can receive per day",
-            placeholder="1",
-            default=str(config.get("give_receive_cooldown_h", 1)),
-            callback=submit
-        ))
-
-    @discord.ui.button(label="📨 Send DMs",              style=discord.ButtonStyle.green,   row=4)
+    @discord.ui.button(label="📨 Send DMs",              style=discord.ButtonStyle.green,   row=3)
     async def btn_send_dms(self, i: discord.Interaction, b):
         """Send the welcome DM to all members of the configured Bulk DM Role."""
         await i.response.defer(ephemeral=True)
@@ -3551,6 +3492,86 @@ class ConfigDMsMenu(_SubMenu):
                       f"**Triggered by:** {i.user.mention}\n"
                       f"**Role:** <@&{bulk_role_id}>\n"
                       f"**Sent:** {sent} | **Failed:** {failed}", C_INFO)
+
+
+class ConfigGiftMenu(_SubMenu):
+    """Configure the 🎁 /give (gift gems) feature."""
+
+    def build_embed(self, config: dict) -> discord.Embed:
+        _on    = lambda v: "✅ Enabled" if v else "❌ Disabled"
+        c_name = config.get("currency_name") or "Gems"
+        e = E("🎁 Gift Gems — /give Settings", color=C_GOLD)
+        e.add_field(name="🎁 /give Enabled",        value=_on(config.get("give_enabled", 0)),           inline=True)
+        e.add_field(name="📤 Max Given/Day",         value=f"**{config.get('give_max_daily', 100)} {c_name}**",     inline=True)
+        e.add_field(name="📥 Recv Limit/Day",        value=f"**{config.get('give_receive_cooldown_h', 1)} gift(s)**", inline=True)
+        e.add_field(name="🔒 Min Balance to Give",   value=f"**{config.get('give_min_balance', 1000)} {c_name}**",  inline=True)
+        e.add_field(name="\u200b", value=(
+            "**Toggle /give** — enable or disable the gift command server-wide\n"
+            "**Max Given/Day** — max gems one member can send as gifts per day\n"
+            "**Recv Limit/Day** — max gifts a member can receive per day (default: 1)\n"
+            "**Min Balance** — sender must hold at least this many gems to use /give (anti-alt)"
+        ), inline=False)
+        return e
+
+    @discord.ui.button(label="🎁 Toggle /give",       style=discord.ButtonStyle.blurple, row=0)
+    async def btn_gift_toggle(self, interaction: discord.Interaction, btn):
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("give_enabled", 0) else 1
+        db_set_config(self.guild.id, give_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Gift gems (/give) {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="📤 Max Given/Day",      style=discord.ButtonStyle.grey,    row=0)
+    async def btn_gift_max(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                v = int(value.strip())
+                if v <= 0: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a positive number.", ephemeral=True); return
+            db_set_config(self.guild.id, give_max_daily=v)
+            await inter.response.send_message(
+                f"✅ Max gift per day set to **{cur(db_get_config(self.guild.id), v)}**.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Max Gift Per Day", "Max gems any member can give per day",
+            placeholder="100", default=str(config.get("give_max_daily", 100)), callback=submit))
+
+    @discord.ui.button(label="📥 Recv Limit/Day",     style=discord.ButtonStyle.grey,    row=0)
+    async def btn_gift_recv(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                v = int(value.strip())
+                if v < 1: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a number ≥ 1.", ephemeral=True); return
+            db_set_config(self.guild.id, give_receive_cooldown_h=v)
+            await inter.response.send_message(
+                f"✅ Members can receive at most **{v}** gift(s) per day.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Gift Receive Limit", "Max gifts a member can receive per day",
+            placeholder="1", default=str(config.get("give_receive_cooldown_h", 1)), callback=submit))
+
+    @discord.ui.button(label="🔒 Min Balance to Give", style=discord.ButtonStyle.grey,   row=0)
+    async def btn_gift_min_bal(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                v = int(value.strip())
+                if v < 0: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a non-negative number.", ephemeral=True); return
+            db_set_config(self.guild.id, give_min_balance=v)
+            await inter.response.send_message(
+                f"✅ Minimum balance to use /give set to **{cur(db_get_config(self.guild.id), v)}**.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Min Balance to Give", "Sender must hold at least this many gems",
+            placeholder="1000", default=str(config.get("give_min_balance", 1000)), callback=submit))
 
 
 class ConfigCurrencyMenu(_SubMenu):
@@ -8495,25 +8516,31 @@ async def cmd_info(interaction: discord.Interaction):
 async def _give_amount_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[int]]:
-    """Show sender's balance, daily limit, and already-sent amount while typing /give amount."""
+    """Show balance, daily limit, min balance, and already-sent amount while typing /give amount."""
     if not interaction.guild_id:
         return []
     try:
         config       = db_get_config(interaction.guild_id)
         give_max     = config.get("give_max_daily", 100)
+        min_bal      = config.get("give_min_balance", 1000)
         already_sent = db_gifts_sent_today(interaction.guild_id, interaction.user.id)
         remaining    = max(0, give_max - already_sent)
         bal          = db_get_xp(interaction.guild_id, interaction.user.id)
         c_name       = config.get("currency_name") or "Gems"
 
         choices = []
+        if bal < min_bal:
+            choices.append(app_commands.Choice(
+                name=f"❌ Need {min_bal} {c_name} min to give (you have {bal})",
+                value=1))
+            return choices
         if remaining == 0:
             choices.append(app_commands.Choice(
-                name=f"Daily limit reached — already sent {already_sent} {c_name} today",
+                name=f"Daily limit reached — already sent {already_sent}/{give_max} {c_name} today",
                 value=1))
         else:
             choices.append(app_commands.Choice(
-                name=f"Max today: {remaining} {c_name}  (balance: {bal}, sent: {already_sent}/{give_max})",
+                name=f"Max today: {remaining} {c_name}  |  balance: {bal}  |  sent: {already_sent}/{give_max}",
                 value=remaining))
             for preset in [10, 25, 50, 100]:
                 if preset < remaining:
@@ -8553,7 +8580,7 @@ async def cmd_give(interaction: discord.Interaction, member: discord.Member, amo
 
     give_max    = config.get("give_max_daily", 100)
     recv_limit  = config.get("give_receive_cooldown_h", 1)  # stored as "max per day"
-    min_balance = 1000  # anti-alt-account minimum — sender must have ≥ 1000 gems
+    min_balance = config.get("give_min_balance", 1000)      # configurable via /config → 🎁 Gift Gems
 
     sender_bal = db_get_xp(interaction.guild_id, sender.id)
     if sender_bal < min_balance:
