@@ -30,6 +30,7 @@ import os
 import json
 import shutil
 import random
+import traceback
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Optional
@@ -1875,6 +1876,13 @@ def _role(v) -> str: return f"<@&{v}>" if v else "`Not set`"
 def _val(v, suffix: str = "") -> str: return f"**{v}{suffix}**" if v is not None else "`Not set`"
 def _bool(v) -> str: return "✅ Enabled" if v else "❌ Disabled"
 
+def _safe_int(value, default: int) -> int:
+    """Convert a persisted config value without breaking a Discord interaction."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 def parse_channel_id(value: str) -> Optional[int]:
     m = re.search(r'<#(\d+)>', value) or re.search(r'(\d+)', value)
     return int(m.group(1)) if m else None
@@ -2741,8 +2749,6 @@ async def send_welcome_dm(member: discord.Member, config: dict, trigger: str = "
 
     `trigger` is a short label used in the log ('join', 'role', 'bulk').
     """
-    info_ch = config.get("info_channel_id")
-    info_str = f"<#{info_ch}>" if info_ch else "the info channel"
     e = discord.Embed(
         title=f"👋 Welcome to **{member.guild.name}**!",
         color=C_MAIN
@@ -2751,7 +2757,7 @@ async def send_welcome_dm(member: discord.Member, config: dict, trigger: str = "
         f"Welcome, **{member.display_name}**! 🎉\n\n"
         "This server rewards members for supporting the community.\n"
         "Share the current video, complete quests, earn Gems, and spend them in `/shop`.\n\n"
-        f"📖 Start with the quick tutorial in {info_str}.\n"
+        "📖 Start with `/tutorial` to learn how to earn and use Gems.\n"
         "If you need help, ping a member with the **Gems Owner** role.\n\n"
         "Have fun and good luck! 🚀"
     )
@@ -2852,6 +2858,7 @@ class PagedTutorialView(discord.ui.View):
         self.back_factory = back_factory
         self.page_index = 0
         self._sync_buttons()
+        self.back_to_menu.disabled = back_factory is None
 
     def _sync_buttons(self):
         self.previous_page.disabled = self.page_index == 0
@@ -2886,6 +2893,9 @@ class PagedTutorialView(discord.ui.View):
 
     @discord.ui.button(label="↩ Back to menu", style=discord.ButtonStyle.green, row=1)
     async def back_to_menu(self, interaction: discord.Interaction, button):
+        if self.back_factory is None:
+            await interaction.response.edit_message(content="✅ Tutorial closed.", embed=None, view=None)
+            return
         menu = self.back_factory(self.guild, self.author_id)
         if isinstance(menu, ConfigMainMenu):
             embed = config_status_embed(self.guild, db_get_config(self.guild.id))
@@ -2896,6 +2906,102 @@ class PagedTutorialView(discord.ui.View):
     @discord.ui.button(label="✖ Close", style=discord.ButtonStyle.red, row=1)
     async def close_tutorial(self, interaction: discord.Interaction, button):
         await interaction.response.edit_message(content="✅ Tutorial closed.", embed=None, view=None)
+
+
+def member_tutorial_pages(guild: discord.Guild) -> list:
+    """Simple member-facing tutorial shown by /tutorial."""
+    config = db_get_config(guild.id)
+    c_name = config.get("currency_name") or "Gems"
+    c_emoji = config.get("currency_emoji") or "💎"
+    share_ch = config.get("share_channel_id")
+    shop_ch = config.get("shop_channel_id")
+    quests_ch = config.get("quests_channel_id")
+    commands_ch = config.get("commands_channel_id")
+    share_text = f"<#{share_ch}>" if share_ch else "the share channel"
+    shop_text = f"<#{shop_ch}>" if shop_ch else "the shop channel"
+    quests_text = f"<#{quests_ch}>" if quests_ch else "the quests channel"
+    commands_text = f"<#{commands_ch}>" if commands_ch else "the commands channel"
+    return [
+        {
+            "title": "👋 Welcome to the rewards system",
+            "description": (
+                "This short guide explains how to earn and use your rewards. "
+                "Press **Next ▶** to continue."
+            ),
+            "fields": [
+                ("Your currency", f"Your server currency is **{c_emoji} {c_name}**.", False),
+                ("Start here", "Use `/gems` to see your balance and rank. Use `/tutorial` any time to reopen this guide.", False),
+            ],
+        },
+        {
+            "title": "1️⃣ Earn rewards",
+            "description": "There are several ways to earn Gems and support the community.",
+            "fields": [
+                ("🎬 Share the current video", f"Use `/video`, then share the video link and proof in {share_text}.", False),
+                ("✅ Reaction bonus", "A Gems Owner may react to an eligible message to give you a Gems bonus.", False),
+                ("📨 Invite members", "Invite someone to the server to earn the configured invite reward.", False),
+                ("🚀 Boost the server", "Server boosts may grant a repeatable reward when this feature is enabled.", False),
+            ],
+        },
+        {
+            "title": "2️⃣ Share a video correctly",
+            "description": "Sharing the current video is the main way to build your reward streak.",
+            "fields": [
+                ("Step 1", "Run `/video` to see which video is currently active.", False),
+                ("Step 2", f"Post the video link and a screenshot of your comment in {share_text}.", False),
+                ("Step 3", "Wait for validation. Do not repost the same video unless staff asks you to.", False),
+                ("🔥 Streak", "Validated consecutive shares build your streak. A Gems reaction bonus never changes your streak.", False),
+            ],
+        },
+        {
+            "title": "3️⃣ Complete daily quests",
+            "description": "Use daily quests for extra rewards and check your progress regularly.",
+            "fields": [
+                ("📅 Check progress", f"Use `/quests` in {quests_text} to see your active quests.", False),
+                ("👑 Gems bonus quest", "When a quest asks for a Gems bonus, **ping the Gems Owner role** and ask for the bonus. You must ping the role.", False),
+                ("Daily reset", "Daily quests refresh automatically. Complete them before the daily reset when possible.", False),
+            ],
+        },
+        {
+            "title": "4️⃣ Spend your Gems",
+            "description": "The shop contains rewards configured by the server team.",
+            "fields": [
+                ("🛒 Browse", f"Use `/shop` in {shop_text} to see available items.", False),
+                ("🛍️ Buy", "Select an item, confirm the purchase, and provide any requested information.", False),
+                ("🎒 Check your items", "Use `/inventory` to see your active and previously purchased rewards.", False),
+                ("🎁 Gift", "If enabled, use `/give` to send Gems to another member within the server limits.", False),
+            ],
+        },
+        {
+            "title": "5️⃣ Useful commands",
+            "description": f"Most commands should be used in {commands_text}.",
+            "fields": [
+                ("`/gems`", f"View your {c_name} balance and rank.", True),
+                ("`/leaderboard`", "See the server ranking.", True),
+                ("`/video`", "See the current video to share.", True),
+                ("`/quests`", "Track daily and monthly quests.", True),
+                ("`/achievements`", "View your achievement progress.", True),
+                ("`/shop` · `/inventory`", "Buy rewards and view your items.", True),
+            ],
+        },
+        {
+            "title": "✅ You are ready",
+            "description": (
+                "Start with `/gems`, check `/video`, and complete your first quest. "
+                "Good luck and have fun!"
+            ),
+            "fields": [
+                ("Need help?", "Ping a member with the **Gems Owner** role and clearly explain what you need.", False),
+                ("Remember", "Be respectful, share valid proof, and never spam the share channel.", False),
+                ("Open this guide again", "Use `/tutorial` whenever you need a refresher.", False),
+            ],
+        },
+    ]
+
+
+class MemberTutorialView(PagedTutorialView):
+    def __init__(self, guild: discord.Guild, author_id: int):
+        super().__init__(guild, author_id, member_tutorial_pages(guild), "Member Tutorial", None)
 
 
 def config_tutorial_pages(guild: discord.Guild) -> list:
@@ -3083,7 +3189,35 @@ class ConfigMainMenu(discord.ui.View):
         return True
 
     async def _go(self, interaction, embed, view):
-        await interaction.response.edit_message(embed=embed, view=view)
+        try:
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception:
+            traceback.print_exc()
+            message = (
+                "❌ This settings page could not be opened. "
+                "The error was logged; please try again."
+            )
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(message, ephemeral=True)
+                else:
+                    await interaction.followup.send(message, ephemeral=True)
+            except Exception:
+                pass
+
+    async def on_error(self, interaction, error, item):
+        traceback.print_exception(type(error), error, error.__traceback__)
+        message = (
+            "❌ This settings action failed before it could finish. "
+            "Please try again; the error was logged."
+        )
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(message, ephemeral=True)
+            else:
+                await interaction.followup.send(message, ephemeral=True)
+        except Exception:
+            pass
 
     # ── Row 0 · Setup ─────────────────────────────────────────
     @discord.ui.button(label="📺 YouTube",      style=discord.ButtonStyle.blurple, row=0)
@@ -3155,8 +3289,25 @@ class ConfigMainMenu(discord.ui.View):
 
     @discord.ui.button(label="📨 DMs & Welcome",style=discord.ButtonStyle.blurple, row=2)
     async def cat_dms(self, i, b):
-        sub = ConfigDMsMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+        # Acknowledge before building the embed. Older persisted configuration
+        # values must never turn a component error into "didn't respond".
+        try:
+            await i.response.defer()
+            sub = ConfigDMsMenu(self.guild, self.author_id)
+            await i.edit_original_response(
+                embed=sub.build_embed(db_get_config(self.guild.id)),
+                view=sub,
+            )
+        except Exception as ex:
+            traceback.print_exception(type(ex), ex, ex.__traceback__)
+            try:
+                await i.followup.send(
+                    "❌ DMs & Welcome could not be opened. "
+                    "The error was logged; please try again.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
     @discord.ui.button(label="🔔 Community",    style=discord.ButtonStyle.blurple, row=2)
     async def cat_community(self, i, b):
@@ -3201,6 +3352,20 @@ class _SubMenu(discord.ui.View):
                     await interaction.message.edit(embed=embed, view=self)
             except Exception:
                 pass
+
+    async def on_error(self, interaction, error, item):
+        traceback.print_exception(type(error), error, error.__traceback__)
+        message = (
+            "❌ This settings action failed before it could finish. "
+            "Please try again; the error was logged."
+        )
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(message, ephemeral=True)
+            else:
+                await interaction.followup.send(message, ephemeral=True)
+        except Exception:
+            pass
 
     @discord.ui.button(label="← Back", style=discord.ButtonStyle.grey, row=4)
     async def btn_back(self, interaction: discord.Interaction, btn: discord.ui.Button):
@@ -3379,7 +3544,7 @@ class ConfigChannelsMenu(_SubMenu):
         e.add_field(name="\u200b", value=(
             "**Share** — members post link + screenshot here\n"
             "**Notifications** — invites, quests, achievements\n"
-            "**Commands** — /gems, /leaderboard, /video, /achievements, /info\n"
+            "**Commands** — /gems, /leaderboard, /video, /achievements, /tutorial\n"
             "**Shop** — /shop and /inventory only (falls back to Commands if not set)\n"
             "**Quests** — /quests only (falls back to Commands if not set)\n"
             "**Admin** — expired items, text orders\n"
@@ -3591,7 +3756,7 @@ class ConfigDMsMenu(_SubMenu):
         e.add_field(name="⚠️ Streak Reminder DM",       value=_on(config.get("streak_reminder_enabled", 0)),  inline=True)
         e.add_field(name="🗓️ Daily Quest DM",            value=_on(config.get("daily_quest_dm_enabled", 1)),   inline=True)
         e.add_field(name="🆕 New Shop Item DM",           value=_on(config.get("new_item_dm_enabled", 1)),      inline=True)
-        new_item_delay = max(0, int(config.get("new_item_dm_delay_minutes") or 5))
+        new_item_delay = max(0, _safe_int(config.get("new_item_dm_delay_minutes"), 5))
         e.add_field(name="⏱️ New Item Delay",             value=f"**{new_item_delay} min**",                  inline=True)
         e.add_field(name="🎫 Purchase DM (to role)",     value=_on(config.get("purchase_dm_enabled", 1)),       inline=True)
         dm_role_val = _role(config.get("purchase_dm_role_id")) if config.get("purchase_dm_role_id") else "`Meeple Owner (default)`"
@@ -3606,7 +3771,7 @@ class ConfigDMsMenu(_SubMenu):
         if notif_mins_raw is None:
             _legacy_days = config.get("notify_prompt_cooldown_days")
             notif_mins_raw = (3 if _legacy_days is None else _legacy_days) * 1440
-        notif_mins = int(notif_mins_raw)
+        notif_mins = _safe_int(notif_mins_raw, 4320)
         if notif_mins <= 0:
             notif_label = "Always show"
         elif notif_mins < 60:
@@ -3776,7 +3941,7 @@ class ConfigDMsMenu(_SubMenu):
         if cur_mins is None:
             _leg = config.get("notify_prompt_cooldown_days")
             cur_mins = (3 if _leg is None else _leg) * 1440
-        cur_mins = int(cur_mins)
+        cur_mins = _safe_int(cur_mins, 4320)
         if cur_mins == 0:
             default_str = "0"
         elif cur_mins % 1440 == 0:
@@ -9574,12 +9739,10 @@ async def on_member_join(member: discord.Member):
         if sw_ch_id:
             sw_ch = bot.get_channel(sw_ch_id)
             if sw_ch:
-                info_ch = config.get("info_channel_id")
-                info_str = f"<#{info_ch}>" if info_ch else "the info channel"
                 try:
                     await sw_ch.send(
                         f"👋 Welcome to **{member.guild.name}**, {member.mention}! "
-                        f"Check out {info_str} to learn how to earn rewards and unlock perks. 🎉"
+                        "Use `/tutorial` to learn how to earn rewards and unlock perks. 🎉"
                     )
                 except Exception:
                     pass
@@ -9727,12 +9890,10 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             if sw_ch_id:
                 sw_ch = bot.get_channel(sw_ch_id)
                 if sw_ch:
-                    info_ch = config.get("info_channel_id")
-                    info_str = f"<#{info_ch}>" if info_ch else "the info channel"
                     try:
                         await sw_ch.send(
                             f"👋 Welcome, {after.mention}! "
-                            f"Check out {info_str} to learn how to earn rewards and unlock perks. 🎉"
+                            "Use `/tutorial` to learn how to earn rewards and unlock perks. 🎉"
                         )
                     except Exception:
                         pass
@@ -10772,77 +10933,17 @@ async def cmd_achievements(interaction: discord.Interaction, member: Optional[di
     await interaction.response.send_message(embed=e)
     await _prompt_ping_role(interaction)
 
-# ── /info ─────────────────────────────────────────────────────
+# ── /tutorial ─────────────────────────────────────────────────
 
-@bot.tree.command(name="info", description="ℹ️ How does the rewards system work?")
-async def cmd_info(interaction: discord.Interaction):
+@bot.tree.command(name="tutorial", description="📖 Learn how to earn and use rewards")
+async def cmd_tutorial(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ Server only.", ephemeral=True)
         return
     if not await _check_commands_channel(interaction):
         return
-    config = db_get_config(interaction.guild_id)
-    c_name = config.get("currency_name") or "Gems"
-    e = E(f"📖 How the rewards system works", color=C_INFO)
-    # Share
-    share_ch = config.get("share_channel_id")
-    e.add_field(
-        name="🎬 Video Share",
-        value=("When a new video drops, share the link + a screenshot of your comment in "
-               + (f"<#{share_ch}>" if share_ch else "the share channel")
-               + f" → **+{cur(config, config.get('share_xp', 100))}** awarded instantly.\n_(Once per video per member)_"),
-        inline=False
-    )
-    # Reaction
-    emoji = config.get("reaction_emoji", "✅")
-    e.add_field(
-        name=f"{emoji} Reaction Bonus",
-        value=f"A Meeple Owner reacts with {emoji} on any message → **+{cur(config, config.get('reaction_xp', 50))}**",
-        inline=False
-    )
-    # Invites
-    e.add_field(
-        name="📨 Invites",
-        value=f"Invite a member → **+{cur(config, config.get('invite_xp', 25))}**",
-        inline=False
-    )
-    # Streak
-    if config.get("streak_enabled", 1):
-        e.add_field(
-            name="🔥 Video Streak",
-            value=(f"Support consecutive videos to build a streak.\n"
-                   f"Bonus: up to **+{cur(config, config.get('streak_xp_cap', 30))}** per share.\n"
-                   f"Streak shown in your nickname as 🔥N."),
-            inline=False
-        )
-    # Boost
-    if config.get("boost_quest_enabled", 1):
-        e.add_field(
-            name="🚀 Server Boost",
-            value=f"Boost the server → **+{cur(config, config.get('boost_quest_xp', 100))}** (repeatable)",
-            inline=False
-        )
-    # Commands
-    cmds_ch   = config.get("commands_channel_id")
-    shop_ch   = config.get("shop_channel_id")
-    quests_ch = config.get("quests_channel_id")
-    shop_ch_str   = f" (in <#{shop_ch}>)"   if shop_ch   else (f" (in <#{cmds_ch}>)" if cmds_ch else "")
-    quests_ch_str = f" (in <#{quests_ch}>)" if quests_ch else (f" (in <#{cmds_ch}>)" if cmds_ch else "")
-    e.add_field(
-        name="📋 Commands" + (f" (use in <#{cmds_ch}>)" if cmds_ch else ""),
-        value=(
-            f"`/gems` — {c_name} balance & rank\n"
-            "`/leaderboard` — Server ranking\n"
-            f"`/shop`{shop_ch_str} — Buy items with {c_name}\n"
-            "`/inventory` — Your items\n"
-            f"`/quests`{quests_ch_str} — Monthly quests\n"
-            "`/achievements` — Your achievements\n"
-            "`/video` — Current video to share"
-        ),
-        inline=False
-    )
-    await interaction.response.send_message(embed=e)
-    await _prompt_ping_role(interaction)
+    view = MemberTutorialView(interaction.guild, interaction.user.id)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
 
 async def _give_amount_autocomplete(
     interaction: discord.Interaction, current: str
