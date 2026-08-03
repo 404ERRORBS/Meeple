@@ -64,6 +64,7 @@ def _is_image_attachment(att) -> bool:
 
 DB_PATH         = "bot_data.db"
 BACKUP_REGISTRY = "backup_channels.json"
+BOT_START_TIME  = datetime.utcnow()   # recorded the instant the process starts
 
 C_MAIN    = 0x5865F2
 C_SUCCESS = 0x57F287
@@ -481,6 +482,19 @@ def init_db():
         "ALTER TABLE guild_config ADD COLUMN give_receive_cooldown_h INTEGER DEFAULT 24",
         "ALTER TABLE guild_config ADD COLUMN give_enabled INTEGER DEFAULT 0",
         "ALTER TABLE guild_config ADD COLUMN give_min_balance INTEGER DEFAULT 1000",
+        # Message visibility / auto-delete TTL (seconds). 0 = permanent, >0 = auto-delete after N seconds.
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_share_reward    INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_share_reject    INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_reaction_bonus  INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_reaction_cooldown INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_block_msg       INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_gems            INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_shop            INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN msg_ttl_leaderboard     INTEGER DEFAULT 0",
+        # Shop item expiry (listing expires — item removed from public shop after this date)
+        "ALTER TABLE shop_items ADD COLUMN item_expires_at TEXT DEFAULT NULL",
+        # Stock visibility in /shop (0 = hidden from members, 1 = shown)
+        "ALTER TABLE shop_items ADD COLUMN show_stock INTEGER DEFAULT 0",
     ]:
         try:
             conn.execute(migration)
@@ -598,6 +612,13 @@ def db_set_config(guild_id: int, **kwargs):
     conn.close()
 
 # ── Currency helper ────────────────────────────────────────────
+
+def _ttl(config: dict, key: str) -> Optional[float]:
+    """Return delete_after seconds or None (permanent) based on config key.
+    0 or unset → None (permanent).  Positive int → seconds before auto-delete.
+    """
+    v = config.get(key, 0)
+    return float(v) if v and v > 0 else None
 
 def cur(config: dict, amount: int = None) -> str:
     """Format the server currency for display.
@@ -2738,82 +2759,28 @@ class ConfigMainMenu(discord.ui.View):
     async def _go(self, interaction, embed, view):
         await interaction.response.edit_message(embed=embed, view=view)
 
-    @discord.ui.button(label="📺 YouTube",     style=discord.ButtonStyle.blurple, row=0)
+    # ── Row 0 · Setup ─────────────────────────────────────────
+    @discord.ui.button(label="📺 YouTube",      style=discord.ButtonStyle.blurple, row=0)
     async def cat_yt(self, i, b):
         sub = ConfigYouTubeMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
-    @discord.ui.button(label="💬 Channels",    style=discord.ButtonStyle.blurple, row=0)
+    @discord.ui.button(label="💬 Channels",     style=discord.ButtonStyle.blurple, row=0)
     async def cat_ch(self, i, b):
         sub = ConfigChannelsMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
-    @discord.ui.button(label="💰 Economy", style=discord.ButtonStyle.blurple, row=0)
-    async def cat_xp(self, i, b):
-        sub = ConfigXPMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="🔥 Streak",      style=discord.ButtonStyle.blurple, row=0)
-    async def cat_streak(self, i, b):
-        sub = ConfigStreakMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="🛒 Shop",        style=discord.ButtonStyle.blurple, row=0)
-    async def cat_shop(self, i, b):
-        sub = ConfigShopMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="📅 Quests",      style=discord.ButtonStyle.blurple, row=1)
-    async def cat_quests(self, i, b):
-        sub = ConfigQuestsMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="🏆 Achievements", style=discord.ButtonStyle.blurple, row=1)
-    async def cat_ach(self, i, b):
-        sub = ConfigAchievementsMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="🎉 Events",      style=discord.ButtonStyle.blurple, row=1)
-    async def cat_events(self, i, b):
-        sub = ConfigEventsMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="👥 Permissions", style=discord.ButtonStyle.blurple, row=1)
+    @discord.ui.button(label="👥 Roles",        style=discord.ButtonStyle.blurple, row=0)
     async def cat_perms(self, i, b):
         sub = ConfigPermissionsMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
-    @discord.ui.button(label="📨 DMs & Welcome", style=discord.ButtonStyle.blurple, row=1)
-    async def cat_dms(self, i, b):
-        sub = ConfigDMsMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="💎 Currency", style=discord.ButtonStyle.green, row=2)
+    @discord.ui.button(label="💎 Currency",     style=discord.ButtonStyle.blurple, row=0)
     async def cat_currency(self, i, b):
         sub = ConfigCurrencyMenu(self.guild, self.author_id)
         await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
-    @discord.ui.button(label="🗓️ Daily Quests", style=discord.ButtonStyle.blurple, row=2)
-    async def cat_daily_quests(self, i, b):
-        sub = ConfigDailyQuestsMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="🚀 Boost Announce", style=discord.ButtonStyle.blurple, row=2)
-    async def cat_boost_announce(self, i, b):
-        sub = ConfigBoostAnnounceMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="🎁 Gift Gems",   style=discord.ButtonStyle.blurple, row=2)
-    async def cat_gift(self, i, b):
-        sub = ConfigGiftMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="🔔 Revive Ping", style=discord.ButtonStyle.blurple, row=2)
-    async def cat_revive_ping(self, i, b):
-        sub = ConfigRevivePingMenu(self.guild, self.author_id)
-        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
-
-    @discord.ui.button(label="📖 Tutorial", style=discord.ButtonStyle.green, row=3)
+    @discord.ui.button(label="📖 Tutorial",     style=discord.ButtonStyle.grey,    row=0)
     async def cat_tutorial(self, i: discord.Interaction, b):
         config  = db_get_config(self.guild.id)
         c_name  = config.get("currency_name")  or "Gems"
@@ -2834,7 +2801,7 @@ class ConfigMainMenu(discord.ui.View):
             "• **Event Announce** — ping channel when events start (optional)"
         ), inline=False)
         e.add_field(name="3️⃣  Assign the Meeple Owner role", value=(
-            "Go to **👥 Permissions** → **Set Meeple Owner Role**.\n"
+            "Go to **👥 Roles** → **Set Meeple Owner Role**.\n"
             "Members with this role can use `/admin` and `/config`.\n"
             "They also receive a DM when a member opens a purchase ticket.\n"
             "Until you set it, any Discord administrator can access the bot."
@@ -2866,6 +2833,58 @@ class ConfigMainMenu(discord.ui.View):
         ), inline=False)
         e.set_footer(text="All settings auto-save. Reopen /config any time to review.")
         await i.response.send_message(embed=e, ephemeral=True)
+
+    # ── Row 1 · Rewards ───────────────────────────────────────
+    @discord.ui.button(label="💰 Rewards",      style=discord.ButtonStyle.blurple, row=1)
+    async def cat_xp(self, i, b):
+        sub = ConfigXPMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="🔥 Streak",       style=discord.ButtonStyle.blurple, row=1)
+    async def cat_streak(self, i, b):
+        sub = ConfigStreakMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="🎁 Gift Gems",    style=discord.ButtonStyle.blurple, row=1)
+    async def cat_gift(self, i, b):
+        sub = ConfigGiftMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="🛒 Shop",         style=discord.ButtonStyle.blurple, row=1)
+    async def cat_shop(self, i, b):
+        sub = ConfigShopMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="👁️ Messages",     style=discord.ButtonStyle.blurple, row=1)
+    async def cat_messages(self, i, b):
+        sub = ConfigMessageVisibilityMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    # ── Row 2 · Community ─────────────────────────────────────
+    @discord.ui.button(label="📅 Quests",       style=discord.ButtonStyle.blurple, row=2)
+    async def cat_quests(self, i, b):
+        sub = ConfigQuestsMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="🏆 Achievements", style=discord.ButtonStyle.blurple, row=2)
+    async def cat_ach(self, i, b):
+        sub = ConfigAchievementsMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="🎉 Events",       style=discord.ButtonStyle.blurple, row=2)
+    async def cat_events(self, i, b):
+        sub = ConfigEventsMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="📨 DMs & Welcome",style=discord.ButtonStyle.blurple, row=2)
+    async def cat_dms(self, i, b):
+        sub = ConfigDMsMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
+
+    @discord.ui.button(label="🔔 Community",    style=discord.ButtonStyle.blurple, row=2)
+    async def cat_community(self, i, b):
+        sub = ConfigCommunityMenu(self.guild, self.author_id)
+        await self._go(i, sub.build_embed(db_get_config(self.guild.id)), sub)
 
 # ══════════════════════════════════════════════════════════════
 #  SUBMENU BASE
@@ -2909,6 +2928,111 @@ class _SubMenu(discord.ui.View):
     @discord.ui.button(label="← Back", style=discord.ButtonStyle.grey, row=4)
     async def btn_back(self, interaction: discord.Interaction, btn: discord.ui.Button):
         await self._back(interaction)
+
+# ══════════════════════════════════════════════════════════════
+#  MESSAGE VISIBILITY SUBMENU
+# ══════════════════════════════════════════════════════════════
+
+_MSG_TTL_LABELS = {
+    "msg_ttl_share_reward":      ("✅ Share Reward",      "Message sent when a share is validated"),
+    "msg_ttl_share_reject":      ("❌ Share Rejection",   "Message sent when a share is rejected"),
+    "msg_ttl_reaction_bonus":    ("💎 Reaction Bonus",   "Message sent when a gems bonus is given"),
+    "msg_ttl_reaction_cooldown": ("⏱️ React Cooldown",   "Cooldown warning when bonus is too soon"),
+    "msg_ttl_block_msg":         ("🚫 Block Message",    "Message blocked notice (no reward)"),
+    "msg_ttl_gems":              ("💰 /gems Response",   "Balance embed from /gems command"),
+    "msg_ttl_shop":              ("🛒 /shop Response",   "Shop embed from /shop command"),
+    "msg_ttl_leaderboard":       ("🏆 /leaderboard",     "Leaderboard from /leaderboard command"),
+}
+
+def _ttl_display(v) -> str:
+    """Human-readable TTL value."""
+    if not v or v == 0:
+        return "Permanent"
+    if v < 60:
+        return f"{v}s"
+    return f"{v // 60}min {v % 60}s" if v % 60 else f"{v // 60}min"
+
+class _SetTTLModal(discord.ui.Modal):
+    def __init__(self, guild, author_id, config_key: str, label: str):
+        super().__init__(title=f"Set display time — {label}")
+        self.guild      = guild
+        self.author_id  = author_id
+        self.config_key = config_key
+        self.field = discord.ui.TextInput(
+            label="Seconds (0 = permanent, e.g. 30, 60, 120)",
+            placeholder="0",
+            max_length=6,
+        )
+        self.add_item(self.field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.field.value.strip()
+        try:
+            secs = max(0, int(raw))
+        except ValueError:
+            await interaction.response.send_message("❌ Enter a whole number of seconds (0 = permanent).", ephemeral=True)
+            return
+        db_set_config(self.guild.id, **{self.config_key: secs})
+        config = db_get_config(self.guild.id)
+        sub = ConfigMessageVisibilityMenu(self.guild, self.author_id)
+        await interaction.response.edit_message(embed=sub.build_embed(config), view=sub)
+
+class ConfigMessageVisibilityMenu(_SubMenu):
+    def build_embed(self, config: dict) -> discord.Embed:
+        e = E("👁️ Message Visibility", color=C_INFO)
+        e.description = (
+            "Control how long each bot message stays visible.\n"
+            "**0 = permanent** — message stays forever.\n"
+            "**N seconds** — message auto-deletes after N seconds.\n\u200b"
+        )
+        for key, (label, desc) in _MSG_TTL_LABELS.items():
+            v = config.get(key, 0)
+            e.add_field(name=label, value=f"{desc}\n**→ {_ttl_display(v)}**", inline=True)
+        return e
+
+    # ── Row 0 ──────────────────────────────────────────────────
+    @discord.ui.button(label="✅ Share Reward",    style=discord.ButtonStyle.blurple, row=0)
+    async def btn_share_reward(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_share_reward", "Share Reward"))
+
+    @discord.ui.button(label="❌ Share Rejection", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_share_reject(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_share_reject", "Share Rejection"))
+
+    @discord.ui.button(label="💎 Reaction Bonus",  style=discord.ButtonStyle.blurple, row=0)
+    async def btn_reaction_bonus(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_reaction_bonus", "Reaction Bonus"))
+
+    @discord.ui.button(label="⏱️ React Cooldown", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_react_cooldown(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_reaction_cooldown", "Reaction Cooldown"))
+
+    @discord.ui.button(label="🚫 Block Message",   style=discord.ButtonStyle.blurple, row=0)
+    async def btn_block_msg(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_block_msg", "Block Message"))
+
+    # ── Row 1 ──────────────────────────────────────────────────
+    @discord.ui.button(label="💰 /gems",           style=discord.ButtonStyle.green,  row=1)
+    async def btn_gems(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_gems", "/gems"))
+
+    @discord.ui.button(label="🛒 /shop",           style=discord.ButtonStyle.green,  row=1)
+    async def btn_shop(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_shop", "/shop"))
+
+    @discord.ui.button(label="🏆 /leaderboard",    style=discord.ButtonStyle.green,  row=1)
+    async def btn_leaderboard(self, i, b):
+        await i.response.send_modal(_SetTTLModal(self.guild, self.author_id, "msg_ttl_leaderboard", "/leaderboard"))
+
+    # ── Reset all ──────────────────────────────────────────────
+    @discord.ui.button(label="🔄 Reset All to Permanent", style=discord.ButtonStyle.red, row=2)
+    async def btn_reset_all(self, i, b):
+        db_set_config(self.guild.id,
+            msg_ttl_share_reward=0, msg_ttl_share_reject=0, msg_ttl_reaction_bonus=0,
+            msg_ttl_reaction_cooldown=0, msg_ttl_block_msg=0, msg_ttl_gems=0,
+            msg_ttl_shop=0, msg_ttl_leaderboard=0)
+        config = db_get_config(self.guild.id)
+        await i.response.edit_message(embed=self.build_embed(config), view=self)
 
 # ══════════════════════════════════════════════════════════════
 #  SUBMENUS
@@ -4121,14 +4245,15 @@ class RevivePingView(discord.ui.View):
 
 class ConfigXPMenu(_SubMenu):
     def build_embed(self, config: dict) -> discord.Embed:
-        e = E("💰 Economy Settings", color=C_GOLD)
-        e.add_field(name="⏰ Share Window",          value=f"**{config.get('share_window_min', 20)} min**",          inline=True)
-        e.add_field(name="✅ Reaction Emoji",        value=config.get("reaction_emoji", "✅"),                        inline=True)
-        e.add_field(name="📹 Video / Reaction",     value=f"**{cur(config, config.get('reaction_xp', 50))}**",       inline=True)
-        e.add_field(name="⏱️ Reaction Cooldown",   value=f"**{config.get('reaction_cooldown_h', 1)}h**",             inline=True)
-        e.add_field(name="📨 Invite Reward",         value=f"**{cur(config, config.get('invite_xp', 25))}**",         inline=True)
-        e.add_field(name="❌ Cancel Emoji",          value=config.get("cancel_emoji", "❌"),                          inline=True)
-        e.set_footer(text="📹 Video / Reaction reward is used for both video shares and manager reactions")
+        e = E("💰 Rewards Settings", color=C_GOLD)
+        e.add_field(name="⏰ Share Window",        value=f"**{config.get('share_window_min', 20)} min**",        inline=True)
+        e.add_field(name="✅ Reaction Emoji",      value=config.get("reaction_emoji", "✅"),                      inline=True)
+        e.add_field(name="❌ Cancel Emoji",        value=config.get("cancel_emoji", "❌"),                        inline=True)
+        e.add_field(name="🎬 Share Reward",        value=f"**{cur(config, config.get('share_xp', 100))}**",      inline=True)
+        e.add_field(name="✅ Reaction Bonus",      value=f"**{cur(config, config.get('reaction_xp', 50))}**",    inline=True)
+        e.add_field(name="⏱️ Reaction Cooldown",  value=f"**{config.get('reaction_cooldown_h', 1)}h**",          inline=True)
+        e.add_field(name="📨 Invite Reward",       value=f"**{cur(config, config.get('invite_xp', 25))}**",      inline=True)
+        e.set_footer(text="🎬 Share Reward = gems per video share  ·  ✅ Reaction Bonus = gems awarded by managers reacting")
         return e
 
     @discord.ui.button(label="Share Window",     style=discord.ButtonStyle.blurple, row=0)
@@ -4158,7 +4283,26 @@ class ConfigXPMenu(_SubMenu):
             placeholder="✅  or  <:custom:1234567890>",
             default=config.get("reaction_emoji", "✅"), callback=submit))
 
-    @discord.ui.button(label="Video / Reaction Reward", style=discord.ButtonStyle.blurple, row=0)
+    @discord.ui.button(label="🎬 Share Reward",      style=discord.ButtonStyle.blurple, row=0)
+    async def btn_share_xp(self, interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                amt = int(value)
+                if amt <= 0: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a positive number.", ephemeral=True)
+                return
+            db_set_config(self.guild.id, share_xp=amt)
+            cfg2 = db_get_config(self.guild.id)
+            await inter.response.send_message(f"✅ Share reward set to **{cur(cfg2, amt)}** per video.", ephemeral=True)
+            await self._refresh(interaction)
+        c_name = config.get("currency_name") or "Gems"
+        await interaction.response.send_modal(Modal1("Share Reward",
+            f"{c_name} awarded per video share",
+            placeholder="100", default=str(config.get("share_xp", 100)), callback=submit))
+
+    @discord.ui.button(label="✅ Reaction Bonus",    style=discord.ButtonStyle.blurple, row=1)
     async def btn_react_xp(self, interaction, btn):
         config = db_get_config(self.guild.id)
         async def submit(inter, value):
@@ -4170,11 +4314,11 @@ class ConfigXPMenu(_SubMenu):
                 return
             db_set_config(self.guild.id, reaction_xp=amt)
             cfg2 = db_get_config(self.guild.id)
-            await inter.response.send_message(f"✅ Video share + Reaction reward set to **{cur(cfg2, amt)}**", ephemeral=True)
+            await inter.response.send_message(f"✅ Reaction bonus set to **{cur(cfg2, amt)}**.", ephemeral=True)
             await self._refresh(interaction)
         c_name = config.get("currency_name") or "Gems"
-        await interaction.response.send_modal(Modal1("Video / Reaction Reward",
-            f"{c_name} per share or manager reaction",
+        await interaction.response.send_modal(Modal1("Reaction Bonus",
+            f"{c_name} awarded when a manager reacts with the reaction emoji",
             placeholder="50", default=str(config.get("reaction_xp", 50)), callback=submit))
 
     @discord.ui.button(label="Reaction Cooldown", style=discord.ButtonStyle.grey, row=1)
@@ -5021,22 +5165,27 @@ class ConfigShopMenu(_SubMenu):
         )
         header.timestamp = datetime.utcnow()
         embeds.append(header)
+        now_iso = datetime.utcnow().isoformat()
+        live_count = 0
         for item in items:
-            stock_info = ""
-            if item.get("stock") is not None:
-                stock_info = " — **Sold out**" if item["stock"] == 0 else f" — **{item['stock']} left**"
-            line = f"{c_emoji} **{item['price']:,} {c_name}**{stock_info}"
+            if item.get("item_expires_at") and item["item_expires_at"] < now_iso:
+                continue
+            line = f"{c_emoji} **{item['price']:,} {c_name}**"
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
             if item.get("image_url"):
                 ie.set_thumbnail(url=item["image_url"])
-            if item.get("provided_by"):
-                ie.set_footer(text=f"Provided by {item['provided_by']}")
+            if item.get("stock") is not None:
+                if item["stock"] == 0:
+                    ie.set_footer(text="🚫 Sold out")
+                else:
+                    ie.set_footer(text=f"📦 {item['stock']} remaining")
             embeds.append(ie)
+            live_count += 1
         try:
             for i in range(0, len(embeds), 10):
                 await ch.send(embeds=embeds[i:i+10])
             await interaction.followup.send(
-                f"✅ Shop posted to <#{ch_id}> — **{len(items)}** item(s).", ephemeral=True)
+                f"✅ Shop posted to <#{ch_id}> — **{live_count}** item(s).", ephemeral=True)
             await bot_log(interaction.client, self.guild.id, "🔄 Shop Posted Manually",
                           f"**By:** {interaction.user.mention}\n**Channel:** <#{ch_id}>\n**Items:** {len(items)}")
         except discord.Forbidden:
@@ -5048,8 +5197,13 @@ class ConfigShopMenu(_SubMenu):
 
 class ConfigQuestsMenu(_SubMenu):
     def build_embed(self, config: dict) -> discord.Embed:
+        _on   = lambda v: "✅ Enabled" if v else "❌ Disabled"
+        _role = lambda rid: f"<@&{rid}>" if rid else "`Not set`"
+        _ch   = lambda cid: f"<#{cid}>" if cid else "`Not set`"
+        _user = lambda uid: f"<@{uid}>" if uid else "`Not set (default: 404ERROR)`"
         e = E("📅 Quest Settings", color=C_QUEST)
-        e.description = "Reward amounts per rarity and enable/disable individual quests from the pool."
+        # ── Monthly quests ──────────────────────────────
+        e.add_field(name="─── Monthly Quests ───", value="\u200b", inline=False)
         e.add_field(name="🪨 Stone",   value=f"**{cur(config, config.get('quest_xp_stone',50))}**",   inline=True)
         e.add_field(name="🥉 Bronze",  value=f"**{cur(config, config.get('quest_xp_bronze',100))}**", inline=True)
         e.add_field(name="🥈 Silver",  value=f"**{cur(config, config.get('quest_xp_silver',200))}**", inline=True)
@@ -5057,8 +5211,21 @@ class ConfigQuestsMenu(_SubMenu):
         e.add_field(name="💎 Diamond", value=f"**{cur(config, config.get('quest_xp_diamond',750))}**",inline=True)
         e.add_field(name="🔄 Boost Quest",value=_bool(config.get("boost_quest_enabled", 1)) +
                     f" — **{cur(config, config.get('boost_quest_xp',100))}** per boost", inline=True)
-        e.set_footer(text="Quests reset monthly. Each user gets 1 random quest per rarity.")
+        # ── Daily quests ─────────────────────────────────
+        e.add_field(name="─── Daily Quests ───", value="\u200b", inline=False)
+        e.add_field(name="Daily Quests",       value=_on(config.get("daily_quest_enabled", 0)),            inline=True)
+        e.add_field(name="Quest Role",         value=_role(config.get("daily_quest_role_id")),              inline=True)
+        e.add_field(name="DM Enabled",         value=_on(config.get("daily_quest_dm_enabled", 1)),         inline=True)
+        daily_xp = config.get("daily_quest_xp", 50)
+        e.add_field(name="Reward per Quest",   value=f"**{daily_xp}** {config.get('currency_emoji','💎')}", inline=True)
+        e.add_field(name="💬 Chat Channel",    value=_ch(config.get("daily_quest_messages_channel_id")),   inline=True)
+        e.add_field(name="👑 Gems Bonus Owner",value=_user(config.get("meeple_owner_user_id")),            inline=True)
+        e.set_footer(text="Monthly: reset each month, 1 quest/rarity per user  ·  Daily: 3 random quests sent at midnight UTC")
         return e
+
+    def _parse_role(self, value: str):
+        raw = value.strip().lstrip("<@&").rstrip(">")
+        return int(raw) if raw.isdigit() else None
 
     @discord.ui.button(label="Set Rarity Reward", style=discord.ButtonStyle.blurple, row=0)
     async def btn_rarity_xp(self, interaction: discord.Interaction, btn):
@@ -5145,6 +5312,107 @@ class ConfigQuestsMenu(_SubMenu):
         sel.callback = on_select
         view.add_item(sel)
         await interaction.response.send_message("Toggle a quest from the pool:", view=view, ephemeral=True)
+
+    # ── Daily quest buttons ────────────────────────────────────
+    @discord.ui.button(label="Toggle Daily Quests", style=discord.ButtonStyle.blurple, row=2)
+    async def btn_daily_toggle(self, interaction: discord.Interaction, btn):
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("daily_quest_enabled", 0) else 1
+        db_set_config(self.guild.id, daily_quest_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Daily quests {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Daily Quest Role", style=discord.ButtonStyle.grey, row=2)
+    async def btn_daily_role(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, daily_quest_role_id=None)
+                await inter.response.send_message("✅ Role removed — quests sent to all members.", ephemeral=True)
+            else:
+                rid = self._parse_role(value)
+                if not rid:
+                    await inter.response.send_message("❌ Invalid role.", ephemeral=True); return
+                db_set_config(self.guild.id, daily_quest_role_id=rid)
+                await inter.response.send_message(f"✅ Daily quests will target <@&{rid}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Daily Quest Role", label="Role mention or ID (empty = all members)",
+            placeholder="@QuestMembers  or  1234567890",
+            default=str(config.get("daily_quest_role_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="Toggle Quest DMs", style=discord.ButtonStyle.blurple, row=2)
+    async def btn_daily_dm_toggle(self, interaction: discord.Interaction, btn):
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("daily_quest_dm_enabled", 1) else 1
+        db_set_config(self.guild.id, daily_quest_dm_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Quest DMs {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Daily Reward XP", style=discord.ButtonStyle.grey, row=3)
+    async def btn_daily_xp(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                xp = int(value.strip())
+                if xp < 0: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Must be a whole number ≥ 0.", ephemeral=True); return
+            db_set_config(self.guild.id, daily_quest_xp=xp)
+            await inter.response.send_message(
+                f"✅ Daily quest reward set to **{xp} {config.get('currency_emoji','💎')}**.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Daily Quest Reward", label="Gems awarded per completed quest",
+            placeholder="50", default=str(config.get("daily_quest_xp", 50)), callback=submit))
+
+    @discord.ui.button(label="💬 Chat Channel", style=discord.ButtonStyle.blurple, row=3)
+    async def btn_daily_chat_ch(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, daily_quest_messages_channel_id=None)
+                await inter.response.send_message("✅ Chat channel removed.", ephemeral=True)
+            else:
+                ch_id = parse_channel_id(value)
+                if not ch_id:
+                    await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+                db_set_config(self.guild.id, daily_quest_messages_channel_id=ch_id)
+                await inter.response.send_message(
+                    f"✅ Daily quest chat channel set to <#{ch_id}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Daily Quest Chat Channel", label="Channel mention or ID (empty = remove)",
+            placeholder="#global  or  1234567890",
+            default=str(config.get("daily_quest_messages_channel_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="👑 Gems Bonus Owner", style=discord.ButtonStyle.blurple, row=3)
+    async def btn_daily_owner(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, meeple_owner_user_id=None)
+                await inter.response.send_message(
+                    "✅ Owner removed — quest will show '404ERROR' by default.", ephemeral=True)
+            else:
+                raw = value.strip().lstrip("<@!").rstrip(">")
+                if not raw.isdigit():
+                    await inter.response.send_message(
+                        "❌ Mention the user or paste their ID.", ephemeral=True); return
+                db_set_config(self.guild.id, meeple_owner_user_id=int(raw))
+                await inter.response.send_message(
+                    f"✅ Gems bonus owner set to <@{raw}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Gems Bonus Owner",
+            label="User mention or ID (empty = default 404ERROR)",
+            placeholder="@404ERROR  or  1234567890",
+            default=str(config.get("meeple_owner_user_id") or ""),
+            required=False, callback=submit))
 
 class ConfigAchievementsMenu(_SubMenu):
     def build_embed(self, config: dict) -> discord.Embed:
@@ -5431,7 +5699,7 @@ class ConfigPermissionsMenu(_SubMenu):
         prefix_role_id = config.get("prefix_role_id")
         nick_prefix    = config.get("nick_prefix") or "404 | "
         lock_role_id   = config.get("share_lock_role_id")
-        e = E("👥 Permissions & Nickname Prefix", color=C_MAIN)
+        e = E("👥 Roles & Permissions", color=C_MAIN)
         c_name = config.get("currency_name") or "Gems"
         e.description = (
             "**Meeple Owner** is the single role controlling this bot.\n"
@@ -5579,6 +5847,214 @@ class ConfigPermissionsMenu(_SubMenu):
 #  /admin — PANEL
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+#  COMMUNITY CONFIG SUBMENU (Boost Announce + Revive Ping)
+# ══════════════════════════════════════════════════════════════
+
+class ConfigCommunityMenu(_SubMenu):
+    """Combined menu for boost announcements, server tag rewards, and revive ping."""
+
+    def build_embed(self, config: dict) -> discord.Embed:
+        _on   = lambda v: "✅ Enabled" if v else "❌ Disabled"
+        _role = lambda rid: f"<@&{rid}>" if rid else "`Not set`"
+        _ch   = lambda cid: f"<#{cid}>" if cid else "`Not set`"
+        channels_raw = config.get("revive_ping_channels") or "[]"
+        try:
+            ch_ids = json.loads(channels_raw)
+        except Exception:
+            ch_ids = []
+        ch_list = ", ".join(f"<#{c}>" for c in ch_ids) if ch_ids else "`None configured`"
+        boost_ch = config.get("boost_announce_channel_id") or config.get("notification_channel_id")
+        e = E("🔔 Community Settings", color=C_ACHIEVE)
+        # ── Boost Announce ─────────────────────────────
+        e.add_field(name="─── 🚀 Boost Announce ───", value="\u200b", inline=False)
+        e.add_field(name="📢 Announce Channel",
+                    value=f"<#{boost_ch}>" if boost_ch else "`Notifications channel`", inline=True)
+        e.add_field(name="📣 Mention Role",
+                    value=_role(config.get("boost_announce_role_id")), inline=True)
+        e.add_field(name="⏱️ Rate Limit", value="**1 per hour**", inline=True)
+        # ── Server Tag ─────────────────────────────────
+        e.add_field(name="─── 🏷️ Server Tag Reward ───", value="\u200b", inline=False)
+        e.add_field(name="Server Tag Reward",
+                    value=_on(config.get("server_tag_enabled", 0)), inline=True)
+        e.add_field(name="Tag Reward Amount",
+                    value=f"**{cur(config, config.get('server_tag_xp', 100))}**", inline=True)
+        e.add_field(name="\u200b", value="\u200b", inline=True)
+        # ── Revive Ping ────────────────────────────────
+        e.add_field(name="─── 🔔 Revive Ping ───", value="\u200b", inline=False)
+        e.add_field(name="Enabled",   value=_on(config.get("revive_ping_enabled", 0)), inline=True)
+        e.add_field(name="Ping Role", value=_role(config.get("revive_ping_role_id")),   inline=True)
+        e.add_field(name="Channels",  value=ch_list,                                    inline=False)
+        e.set_footer(text=(
+            "Boost: posts a thank-you when a member boosts (rate-limited 1×/hour)  ·  "
+            "Server Tag: awards gems for enabling the server's clan tag  ·  "
+            "Revive Ping: daily opt-in/out button posted in a random configured channel"
+        ))
+        return e
+
+    def _parse_role(self, value: str):
+        raw = value.strip().lstrip("<@&").rstrip(">")
+        return int(raw) if raw.isdigit() else None
+
+    def _parse_ch(self, value: str):
+        raw = value.strip().lstrip("<#").rstrip(">")
+        return int(raw) if raw.isdigit() else None
+
+    def _get_revive_channels(self, config: dict) -> list:
+        try:
+            return json.loads(config.get("revive_ping_channels") or "[]")
+        except Exception:
+            return []
+
+    # ── Row 0 · Boost Announce ────────────────────────────────
+    @discord.ui.button(label="📢 Announce Channel", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_boost_channel(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, boost_announce_channel_id=None)
+                await inter.response.send_message(
+                    "✅ Boost announce channel cleared — will use Notifications channel.", ephemeral=True)
+            else:
+                cid = self._parse_ch(value)
+                if not cid:
+                    await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+                db_set_config(self.guild.id, boost_announce_channel_id=cid)
+                await inter.response.send_message(
+                    f"✅ Boost announcements will go to <#{cid}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Boost Announce Channel",
+            label="Channel mention or ID (empty = Notifications)",
+            placeholder="#boosts  or  1234567890",
+            default=str(config.get("boost_announce_channel_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="📣 Boost Mention Role", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_boost_role(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, boost_announce_role_id=None)
+                await inter.response.send_message(
+                    "✅ Boost mention role removed — no role will be pinged.", ephemeral=True)
+            else:
+                rid = self._parse_role(value)
+                if not rid:
+                    await inter.response.send_message("❌ Invalid role.", ephemeral=True); return
+                db_set_config(self.guild.id, boost_announce_role_id=rid)
+                await inter.response.send_message(
+                    f"✅ Boost announcements will mention <@&{rid}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Boost Announce Role",
+            label="Role mention or ID (empty = no ping)",
+            placeholder="@Booster  or  1234567890",
+            default=str(config.get("boost_announce_role_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="🏷️ Toggle Server Tag", style=discord.ButtonStyle.green, row=0)
+    async def btn_tag_toggle(self, interaction: discord.Interaction, btn):
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("server_tag_enabled", 0) else 1
+        db_set_config(self.guild.id, server_tag_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Server tag reward {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="🏷️ Tag Reward Amount", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_tag_xp(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                xp = int(value)
+                if xp < 0: raise ValueError
+            except ValueError:
+                await inter.response.send_message("❌ Enter a non-negative number.", ephemeral=True); return
+            db_set_config(self.guild.id, server_tag_xp=xp)
+            cfg2 = db_get_config(self.guild.id)
+            await inter.response.send_message(
+                f"✅ Server tag reward set to **{cur(cfg2, xp)}**.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Server Tag Reward", "Gems awarded for enabling server tag",
+            placeholder="100", default=str(config.get("server_tag_xp", 100)), callback=submit))
+
+    # ── Row 1 · Revive Ping ───────────────────────────────────
+    @discord.ui.button(label="Toggle Revive Ping", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_revive_toggle(self, interaction: discord.Interaction, btn):
+        config  = db_get_config(self.guild.id)
+        new_val = 0 if config.get("revive_ping_enabled", 0) else 1
+        db_set_config(self.guild.id, revive_ping_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Revive ping {'**enabled**' if new_val else '**disabled**'}.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="🔔 Set Ping Role", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_revive_role(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, revive_ping_role_id=None)
+                await inter.response.send_message("✅ Revive ping role removed.", ephemeral=True)
+            else:
+                rid = self._parse_role(value)
+                if not rid:
+                    await inter.response.send_message("❌ Invalid role.", ephemeral=True); return
+                db_set_config(self.guild.id, revive_ping_role_id=rid)
+                await inter.response.send_message(
+                    f"✅ Revive ping role set to <@&{rid}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Revive Ping Role",
+            label="Role mention or ID (empty = remove)",
+            placeholder="@revive-ping  or  1234567890",
+            default=str(config.get("revive_ping_role_id") or ""),
+            required=False, callback=submit))
+
+    @discord.ui.button(label="➕ Add Revive Channel", style=discord.ButtonStyle.green, row=1)
+    async def btn_revive_add_ch(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            ch_id = parse_channel_id(value)
+            if not ch_id:
+                await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+            ch_ids = self._get_revive_channels(config)
+            if ch_id in ch_ids:
+                await inter.response.send_message("⚠️ That channel is already in the list.", ephemeral=True); return
+            ch_ids.append(ch_id)
+            db_set_config(self.guild.id, revive_ping_channels=json.dumps(ch_ids))
+            await inter.response.send_message(f"✅ <#{ch_id}> added to revive ping channels.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Add Revive Ping Channel", label="Channel mention or ID",
+            placeholder="#general  or  1234567890", callback=submit))
+
+    @discord.ui.button(label="➖ Remove Revive Channel", style=discord.ButtonStyle.red, row=1)
+    async def btn_revive_remove_ch(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            ch_id = parse_channel_id(value)
+            if not ch_id:
+                await inter.response.send_message("❌ Invalid channel.", ephemeral=True); return
+            ch_ids = self._get_revive_channels(config)
+            if ch_id not in ch_ids:
+                await inter.response.send_message("⚠️ That channel is not in the list.", ephemeral=True); return
+            ch_ids.remove(ch_id)
+            db_set_config(self.guild.id, revive_ping_channels=json.dumps(ch_ids))
+            await inter.response.send_message(f"✅ <#{ch_id}> removed from revive ping channels.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Remove Revive Ping Channel", label="Channel mention or ID to remove",
+            placeholder="#general  or  1234567890", callback=submit))
+
+    # ← Back is inherited from _SubMenu
+
+
+# ══════════════════════════════════════════════════════════════
+#  /admin — PANEL
+# ══════════════════════════════════════════════════════════════
+
 def admin_main_embed(guild: discord.Guild) -> discord.Embed:
     e = E(f"🛠️ Admin Panel — {guild.name}", color=C_INFO)
     e.description = "Manage balances, announcements, backups, and community goals."
@@ -5667,7 +6143,12 @@ class AdminMainMenu(discord.ui.View):
                         value=f"[{current['video_title']}]({make_shorts_url(current['video_id'])})", inline=False)
         await i.response.send_message(embed=e, ephemeral=True)
 
-    @discord.ui.button(label="🏁 Community Goals", style=discord.ButtonStyle.grey, row=1)
+    @discord.ui.button(label="🛒 Manage Shop",      style=discord.ButtonStyle.blurple, row=1)
+    async def cat_shop(self, i: discord.Interaction, b):
+        sub = AdminShopMenu(self.guild, self.author_id)
+        await i.response.edit_message(embed=sub.build_embed(), view=sub)
+
+    @discord.ui.button(label="🏁 Community Goals", style=discord.ButtonStyle.grey,   row=1)
     async def cat_goals(self, i: discord.Interaction, b):
         goals = db_get_community_goals(self.guild.id)
         config = db_get_config(self.guild.id)
@@ -5706,7 +6187,7 @@ class AdminMainMenu(discord.ui.View):
             "• **Event Announce** — ping when you launch an event (optional)"
         ), inline=False)
         e.add_field(name="3️⃣  Set the Meeple Owner role", value=(
-            "Go to **👥 Permissions** in /config → Set Meeple Owner Role.\n"
+            "Go to **👥 Roles** in /config → Set Meeple Owner Role.\n"
             "Members with this role can use `/admin` and `/config`.\n"
             "Until you set it, any Discord administrator can access the bot."
         ), inline=False)
@@ -5946,22 +6427,31 @@ class AdminShopMenu(discord.ui.View):
         return True
 
     def build_embed(self) -> discord.Embed:
-        items = db_get_shop_items(self.guild.id)
+        items  = db_get_shop_items(self.guild.id)
         config = db_get_config(self.guild.id)
+        now_iso = datetime.utcnow().isoformat()
         e = E("🛒 Manage Shop", color=C_GOLD)
         if not items:
             e.description = "Shop is empty."
         else:
             for item in items[:15]:
                 tags = []
-                if item.get("is_temporary"): tags.append(f"⏳{item['duration_days']}d")
-                if item.get("requires_text"): tags.append("📝")
-                if item.get("image_url"): tags.append("🖼️")
+                if item.get("is_temporary"):   tags.append(f"⏳{item['duration_days']}d")
+                if item.get("requires_text"):  tags.append("📝")
+                if item.get("image_url"):      tags.append("🖼️")
+                if item.get("show_stock"):     tags.append("📦vis")
+                exp = item.get("item_expires_at")
+                if exp:
+                    expired = exp < now_iso
+                    exp_short = exp[:10]
+                    tags.append(f"🗓️{exp_short}{'❌' if expired else ''}")
                 e.add_field(
-                    name=f"{item['name']}",
-                    value=f"**{cur(config, item['price'])}** ID:`{item['id']}`{'  ' + ''.join(tags) if tags else ''}",
+                    name=item['name'],
+                    value=f"**{cur(config, item['price'])}** · ID:`{item['id']}`"
+                          + (f"\n{'  '.join(tags)}" if tags else ""),
                     inline=True
                 )
+        e.set_footer(text="⏳=temp  📝=text req  🖼️=image  📦vis=stock visible  🗓️=listing expiry (❌=expired)")
         return e
 
     async def _back(self, i):
@@ -6097,6 +6587,158 @@ class AdminShopMenu(discord.ui.View):
         sel1.callback = on_pick_item
         view1.add_item(sel1)
         await interaction.response.send_message("↕️ Which item do you want to move?", view=view1, ephemeral=True)
+
+    @discord.ui.button(label="💰 Edit Price",   style=discord.ButtonStyle.blurple, row=1)
+    async def btn_edit_price(self, interaction: discord.Interaction, btn):
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        cfg = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{i['name'][:80]} — {cur(cfg, i['price'])}",
+                value=str(i["id"])
+            ) for i in items[:25]
+        ]
+        view      = discord.ui.View(timeout=60)
+        sel       = discord.ui.Select(placeholder="Choose item to reprice", options=options)
+        guild_ref = self.guild
+        parent    = interaction
+        all_items = items
+        async def on_select(inter2):
+            item_id = int(sel.values[0])
+            chosen  = next((i for i in all_items if i["id"] == item_id), None)
+            cur_price = str(chosen["price"]) if chosen else ""
+            c_name  = cfg.get("currency_name") or "Gems"
+            async def price_submit(inter3, value):
+                try:
+                    new_price = int(value.strip())
+                    if new_price <= 0: raise ValueError
+                except ValueError:
+                    await inter3.response.send_message("❌ Enter a positive number.", ephemeral=True)
+                    return
+                conn = get_db()
+                conn.execute("UPDATE shop_items SET price=? WHERE id=? AND guild_id=?",
+                             (new_price, item_id, guild_ref.id))
+                conn.commit()
+                conn.close()
+                await inter3.response.send_message(
+                    f"✅ **{chosen['name']}** repriced to **{cur(cfg, new_price)}**.", ephemeral=True)
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                f"Edit Price — {chosen['name'][:40] if chosen else '?'}",
+                label=f"New price in {c_name}",
+                placeholder="100",
+                default=cur_price,
+                callback=price_submit,
+            ))
+        sel.callback = on_select
+        view.add_item(sel)
+        await interaction.response.send_message("💰 Choose an item to reprice:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="📅 Set Expiry",   style=discord.ButtonStyle.grey,    row=2)
+    async def btn_set_expiry(self, interaction: discord.Interaction, btn):
+        """Set or clear the listing expiry date for a shop item (YYYY-MM-DD)."""
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        cfg = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{i['name'][:60]} — {cur(cfg, i['price'])}",
+                value=str(i["id"]),
+                description=f"Expires {i['item_expires_at'][:10]}" if i.get("item_expires_at") else "No expiry",
+            ) for i in items[:25]
+        ]
+        view      = discord.ui.View(timeout=60)
+        sel       = discord.ui.Select(placeholder="Choose item to set expiry", options=options)
+        guild_ref = self.guild
+        parent    = interaction
+        all_items = items
+        async def on_select(inter2):
+            item_id = int(sel.values[0])
+            chosen  = next((i for i in all_items if i["id"] == item_id), None)
+            cur_exp = (chosen.get("item_expires_at") or "")[:10] if chosen else ""
+            async def expiry_submit(inter3, value):
+                v = value.strip()
+                if not v:
+                    # Clear expiry
+                    conn = get_db()
+                    conn.execute("UPDATE shop_items SET item_expires_at=NULL WHERE id=? AND guild_id=?",
+                                 (item_id, guild_ref.id))
+                    conn.commit(); conn.close()
+                    await inter3.response.send_message(
+                        f"✅ Expiry removed from **{chosen['name']}** — listing never expires.", ephemeral=True)
+                else:
+                    # Parse and validate date
+                    try:
+                        from datetime import date as _date
+                        parsed = _date.fromisoformat(v)
+                        iso_str = parsed.isoformat() + "T23:59:59"
+                    except ValueError:
+                        await inter3.response.send_message(
+                            "❌ Invalid date. Use **YYYY-MM-DD** format (e.g. `2026-12-31`).", ephemeral=True)
+                        return
+                    conn = get_db()
+                    conn.execute("UPDATE shop_items SET item_expires_at=? WHERE id=? AND guild_id=?",
+                                 (iso_str, item_id, guild_ref.id))
+                    conn.commit(); conn.close()
+                    await inter3.response.send_message(
+                        f"✅ **{chosen['name']}** will expire on **{parsed.isoformat()}** "
+                        f"and be hidden from the shop after that date.", ephemeral=True)
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                f"Set Expiry — {chosen['name'][:40] if chosen else '?'}",
+                label="Expiry date (YYYY-MM-DD) — empty to remove",
+                placeholder="2026-12-31",
+                default=cur_exp,
+                required=False,
+                callback=expiry_submit,
+            ))
+        sel.callback = on_select
+        view.add_item(sel)
+        await interaction.response.send_message("📅 Choose an item to set a listing expiry:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="👁️ Stock Visible", style=discord.ButtonStyle.grey,    row=2)
+    async def btn_toggle_stock_vis(self, interaction: discord.Interaction, btn):
+        """Toggle whether remaining stock count is shown to members in /shop."""
+        items = db_get_shop_items(self.guild.id)
+        stock_items = [i for i in items if i.get("stock") is not None]
+        if not stock_items:
+            await interaction.response.send_message(
+                "❌ No items have a stock limit set. Add stock when creating an item.", ephemeral=True)
+            return
+        cfg = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{i['name'][:60]} — {cur(cfg, i['price'])}",
+                value=str(i["id"]),
+                description="👁️ Stock SHOWN in /shop" if i.get("show_stock", 0) else "🔇 Stock HIDDEN from /shop",
+            ) for i in stock_items[:25]
+        ]
+        view      = discord.ui.View(timeout=60)
+        sel       = discord.ui.Select(placeholder="Choose item to toggle stock visibility", options=options)
+        guild_ref = self.guild
+        parent    = interaction
+        all_items = stock_items
+        async def on_select(inter2):
+            item_id  = int(sel.values[0])
+            chosen   = next((i for i in all_items if i["id"] == item_id), None)
+            new_show = 0 if chosen and chosen.get("show_stock", 0) else 1
+            conn = get_db()
+            conn.execute("UPDATE shop_items SET show_stock=? WHERE id=? AND guild_id=?",
+                         (new_show, item_id, guild_ref.id))
+            conn.commit(); conn.close()
+            label = "👁️ Stock now **shown** in /shop" if new_show else "🔇 Stock now **hidden** from /shop"
+            await inter2.response.send_message(
+                f"{label} for **{chosen['name'] if chosen else '?'}**.", ephemeral=True)
+            await self._refresh(parent)
+        sel.callback = on_select
+        view.add_item(sel)
+        await interaction.response.send_message(
+            "👁️ Choose an item to toggle its stock visibility in **/shop**:", view=view, ephemeral=True)
 
 # ══════════════════════════════════════════════════════════════
 #  /shop — MEMBER SHOP VIEW
@@ -6371,7 +7013,12 @@ class ShopView(discord.ui.View):
         self.guild = guild
         self.user  = user
         self.page  = page
-        self.items = db_get_shop_items(guild.id)
+        # Filter out items whose listing has expired
+        now_iso = datetime.utcnow().isoformat()
+        self.items = [
+            i for i in db_get_shop_items(guild.id)
+            if not (i.get("item_expires_at") and i["item_expires_at"] < now_iso)
+        ]
         self._msg: Optional[discord.Message] = None  # set by /shop after sending
         self._build()
 
@@ -6494,13 +7141,13 @@ class ShopView(discord.ui.View):
             if item.get("provided_by"):
                 ie.add_field(name="🤝 Provided by", value=item["provided_by"], inline=True)
 
-            # Show stock info
+            # Show stock info only if admin enabled visibility
             item_id = item.get("id")
             if item_id:
                 avail_rewards = db_count_available_rewards(item_id, self.guild.id)
                 if avail_rewards > 0:
                     ie.add_field(name="🔑 Rewards in stock", value=f"**{avail_rewards}** — delivered instantly", inline=True)
-                elif item.get("stock") is not None:
+                elif item.get("stock") is not None and item.get("show_stock", 0):
                     stock_left = item["stock"]
                     if stock_left == 0:
                         ie.add_field(name="📦 Stock", value="**Sold out**", inline=True)
@@ -7030,20 +7677,24 @@ async def send_daily_shop():
         )
         header.timestamp = datetime.utcnow()
         embeds.append(header)
+        now_iso = datetime.utcnow().isoformat()
         for item in items:
-            stock_info = ""
-            if item.get("stock") is not None:
-                if item["stock"] == 0:
-                    stock_info = " — **Sold out**"
-                else:
-                    stock_info = f" — **{item['stock']} left**"
-            line = f"{c_emoji} **{item['price']:,} {c_name}**{stock_info}"
+            # Skip items whose listing has expired
+            if item.get("item_expires_at") and item["item_expires_at"] < now_iso:
+                continue
+            line = f"{c_emoji} **{item['price']:,} {c_name}**"
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
             if item.get("image_url"):
                 ie.set_thumbnail(url=item["image_url"])
-            if item.get("provided_by"):
-                ie.set_footer(text=f"Provided by {item['provided_by']}")
+            # Footer: remaining stock (replaces "Provided by")
+            if item.get("stock") is not None:
+                if item["stock"] == 0:
+                    ie.set_footer(text="🚫 Sold out")
+                else:
+                    ie.set_footer(text=f"📦 {item['stock']} remaining")
             embeds.append(ie)
+        if len(embeds) == 1:   # only the header, no live items
+            continue
         # Discord allows up to 10 embeds per message
         posted = False
         for i in range(0, len(embeds), 10):
@@ -7151,7 +7802,23 @@ async def before_revive_ping():
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
+    now        = datetime.utcnow()
+    boot_delta = now - BOT_START_TIME
+    boot_secs  = int(boot_delta.total_seconds())
+    if boot_secs < 60:
+        boot_str = f"{boot_secs}s"
+    elif boot_secs < 3600:
+        boot_str = f"{boot_secs // 60}min {boot_secs % 60}s"
+    else:
+        h = boot_secs // 3600
+        m = (boot_secs % 3600) // 60
+        boot_str = f"{h}h {m}min"
+    print("=" * 60)
+    print(f"🔄 BOT RESTARTED — {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"   Process boot time : {boot_str}")
+    print(f"   Logged in as      : {bot.user} ({bot.user.id})")
+    print(f"   Guilds            : {len(bot.guilds)}")
+    print("=" * 60)
     await restore_from_discord(bot)
     init_db()
     # Cache invites for all guilds
@@ -7564,14 +8231,14 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                     notif += f" — streak reset to 🔥{streak_before_rev}"
                 notif += " — can retry with a new post."
                 try:
-                    await channel.send(notif, delete_after=20)
+                    await channel.send(notif, delete_after=_ttl(config_r, "msg_ttl_share_reject"))
                 except Exception:
                     pass
             else:
                 try:
                     await channel.send(
                         f"🚫 Message blocked for {mention} — no reward can be assigned.",
-                        delete_after=10)
+                        delete_after=_ttl(config_r, "msg_ttl_block_msg"))
                 except Exception:
                     pass
 
@@ -7633,7 +8300,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         try:
             await channel.send(
                 f"⏱️ {target.mention} must wait **{mins_left} min** before receiving a reaction bonus again.",
-                delete_after=10)
+                delete_after=_ttl(config, "msg_ttl_reaction_cooldown"))
         except Exception:
             pass
         return
@@ -7674,7 +8341,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if streak_updated:
         msg += f"\n🔥 Streak updated: **{streak_updated}**"
     try:
-        await channel.send(msg)
+        await channel.send(msg, delete_after=_ttl(config_r, "msg_ttl_reaction_bonus"))
     except Exception:
         pass
     await check_achievements(bot, payload.guild_id, target.id)
@@ -7899,7 +8566,7 @@ async def _handle_share(message: discord.Message, config: dict):
     if position <= 5:
         parts.append(f"🥇 You're #{position} to share this video!")
     try:
-        await message.reply("\n".join(parts))
+        await message.reply("\n".join(parts), delete_after=_ttl(config, "msg_ttl_share_reward"))
     except Exception:
         pass
     # Log the validated share
@@ -8179,7 +8846,7 @@ async def cmd_gems(interaction: discord.Interaction, member: Optional[discord.Me
     if config.get("streak_enabled", 1):
         e.add_field(name="🔥 Streak",value=f"**{streak['current_streak']}**"
                     + (f" (max: {streak['max_streak']})" if streak["max_streak"] else ""), inline=True)
-    await interaction.response.send_message(embed=e)
+    await interaction.response.send_message(embed=e, delete_after=_ttl(config, "msg_ttl_gems"))
     # Daily quest: "Check your balance with /gems" (only for own balance check)
     if target.id == interaction.user.id:
         config2 = db_get_config(interaction.guild_id)
@@ -8219,7 +8886,7 @@ async def cmd_leaderboard(interaction: discord.Interaction, limit: int = 10):
         streak_str = f" 🔥{streak['current_streak']}" if streak["current_streak"] > 0 else ""
         lines.append(f"{prefix} **{name}**{streak_str} — {cur(config, xp)}")
     e = E(f"🏆 Leaderboard — Top {limit}", "\n".join(lines), C_GOLD)
-    await interaction.followup.send(embed=e)
+    await interaction.followup.send(embed=e, delete_after=_ttl(config, "msg_ttl_leaderboard"))
     await _prompt_ping_role(interaction)
 
 # ── /streak ───────────────────────────────────────────────────
@@ -8297,8 +8964,10 @@ async def cmd_shop(interaction: discord.Interaction):
         return
     if not isinstance(interaction.user, discord.Member):
         return
+    config = db_get_config(interaction.guild_id)
     view = ShopView(interaction.guild, interaction.user)
-    await interaction.response.send_message(embeds=view.embeds(), view=view)
+    await interaction.response.send_message(embeds=view.embeds(), view=view,
+                                            delete_after=_ttl(config, "msg_ttl_shop"))
     # Store message ref so on_timeout can disable the buttons
     try:
         view._msg = await interaction.original_response()

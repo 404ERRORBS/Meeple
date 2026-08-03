@@ -1,4 +1,6 @@
-bot_data.db
+*.db
+*.db-shm
+*.db-wal
 .env
 __pycache__/
 *.pyc
