@@ -794,6 +794,14 @@ def db_set_shop_item_name(item_id: int, guild_id: int, new_name: str):
     conn.commit()
     conn.close()
 
+def db_set_shop_item_price(item_id: int, guild_id: int, price: int):
+    """Update a shop item's price."""
+    conn = get_db()
+    conn.execute("UPDATE shop_items SET price=? WHERE id=? AND guild_id=?",
+                 (price, item_id, guild_id))
+    conn.commit()
+    conn.close()
+
 
 def db_reorder_shop_items(guild_id: int, ordered_ids: list[int]):
     """Assign sort_order 1,2,3,... to the given item ids in order."""
@@ -2263,11 +2271,13 @@ class Modal1(discord.ui.Modal):
     def __init__(self, title: str, label: str, placeholder: str = "",
                  default: str = "", required: bool = True, max_length: int = 200,
                  paragraph: bool = False, callback=None):
-        super().__init__(title=title)
+        # Discord rejects modal titles longer than 45 characters. Item names
+        # are user-provided, so always clamp dynamic titles before opening.
+        super().__init__(title=str(title)[:45])
         self._cb = callback
         style = discord.TextStyle.paragraph if paragraph else discord.TextStyle.short
-        self.field = discord.ui.TextInput(label=label, placeholder=placeholder,
-                                          default=default, required=required,
+        self.field = discord.ui.TextInput(label=str(label)[:45], placeholder=str(placeholder)[:100],
+                                          default=str(default)[:4000], required=required,
                                           max_length=max_length, style=style)
         self.add_item(self.field)
 
@@ -2287,10 +2297,10 @@ class Modal2(discord.ui.Modal):
     def __init__(self, title: str, label1: str, ph1: str, label2: str, ph2: str,
                  default1: str = "", default2: str = "", required1: bool = True, required2: bool = True,
                  max1: int = 200, max2: int = 200, callback=None):
-        super().__init__(title=title)
+        super().__init__(title=str(title)[:45])
         self._cb = callback
-        self.f1 = discord.ui.TextInput(label=label1, placeholder=ph1, default=default1, required=required1, max_length=max1)
-        self.f2 = discord.ui.TextInput(label=label2, placeholder=ph2, default=default2, required=required2, max_length=max2)
+        self.f1 = discord.ui.TextInput(label=str(label1)[:45], placeholder=str(ph1)[:100], default=str(default1)[:4000], required=required1, max_length=max1)
+        self.f2 = discord.ui.TextInput(label=str(label2)[:45], placeholder=str(ph2)[:100], default=str(default2)[:4000], required=required2, max_length=max2)
         self.add_item(self.f1)
         self.add_item(self.f2)
 
@@ -2314,11 +2324,11 @@ class Modal3(discord.ui.Modal):
                  default1="", default2="", default3="",
                  required1=True, required2=True, required3=True,
                  callback=None):
-        super().__init__(title=title)
+        super().__init__(title=str(title)[:45])
         self._cb = callback
-        self.f1 = discord.ui.TextInput(label=label1, placeholder=ph1, default=default1, required=required1)
-        self.f2 = discord.ui.TextInput(label=label2, placeholder=ph2, default=default2, required=required2)
-        self.f3 = discord.ui.TextInput(label=label3, placeholder=ph3, default=default3, required=required3)
+        self.f1 = discord.ui.TextInput(label=str(label1)[:45], placeholder=str(ph1)[:100], default=str(default1)[:4000], required=required1)
+        self.f2 = discord.ui.TextInput(label=str(label2)[:45], placeholder=str(ph2)[:100], default=str(default2)[:4000], required=required2)
+        self.f3 = discord.ui.TextInput(label=str(label3)[:45], placeholder=str(ph3)[:100], default=str(default3)[:4000], required=required3)
         self.add_item(self.f1); self.add_item(self.f2); self.add_item(self.f3)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -2336,10 +2346,10 @@ class Modal3(discord.ui.Modal):
 class Modal4Shop(discord.ui.Modal):
     """4-field modal for shop item creation (image is uploaded separately)."""
     def __init__(self, title: str, currency_label: str = "Gems", callback=None):
-        super().__init__(title=title)
+        super().__init__(title=str(title)[:45])
         self._cb = callback
         self.f_name  = discord.ui.TextInput(label="Item name (emoji welcome)", placeholder="🎮 Custom Role", max_length=80)
-        self.f_price = discord.ui.TextInput(label=f"Price in {currency_label}", placeholder="500")
+        self.f_price = discord.ui.TextInput(label=f"Price in {str(currency_label)[:30]}", placeholder="500")
         self.f_temp  = discord.ui.TextInput(label="Duration in days (0 = permanent)", placeholder="0 or 30")
         self.f_text  = discord.ui.TextInput(label="Text field label (empty = none)", placeholder="Your game username", required=False)
         for f in [self.f_name, self.f_price, self.f_temp, self.f_text]:
@@ -2364,10 +2374,10 @@ class Modal5(discord.ui.Modal):
     Image URL is set separately via the 'Set Image URL' button after creation.
     """
     def __init__(self, title: str, currency_label: str = "Gems", callback=None):
-        super().__init__(title=title)
+        super().__init__(title=str(title)[:45])
         self._cb = callback
         self.f_name  = discord.ui.TextInput(label="Item name (emoji welcome)", placeholder="🎮 Custom Role", max_length=80)
-        self.f_price = discord.ui.TextInput(label=f"Price in {currency_label}", placeholder="500")
+        self.f_price = discord.ui.TextInput(label=f"Price in {str(currency_label)[:30]}", placeholder="500")
         self.f_stock = discord.ui.TextInput(label="Stock quantity (0 = unlimited)", placeholder="0", required=False)
         self.f_temp  = discord.ui.TextInput(label="Duration in days (0 = permanent)", placeholder="0 or 30")
         self.f_text  = discord.ui.TextInput(label="Text field label (empty = none)", placeholder="Your game username", required=False)
@@ -4437,7 +4447,7 @@ class ConfigStreakMenu(_SubMenu):
         db_set_config(self.guild.id, streak_reset_on_miss=new_val)
         await interaction.response.edit_message(embed=self.build_embed(db_get_config(self.guild.id)), view=self)
 
-class ConfigShopMenu(_SubMenu):
+class LegacyConfigShopMenu(_SubMenu):
     def build_embed(self, config: dict) -> discord.Embed:
         items = db_get_shop_items(self.guild.id)
         c_name = config.get("currency_name") or "Gems"
@@ -4791,6 +4801,77 @@ class ConfigShopMenu(_SubMenu):
         e = E("📊 Reward Stock Overview", "\n".join(lines), C_GOLD)
         e.set_footer(text="Pre-load rewards with 🔑 Add Rewards. Each purchase auto-claims one.")
         await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="💰 Edit Price", style=discord.ButtonStyle.blurple, row=2)
+    async def btn_edit_price(self, interaction: discord.Interaction, btn):
+        """Change the price of an existing item from the /config shop panel."""
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        options = [
+            discord.SelectOption(
+                label=f"{item['name'][:70]}  —  {cur(config, item['price'])}",
+                description="Choose this item to update its price",
+                value=str(item["id"]),
+            )
+            for item in items[:25]
+        ]
+        view = discord.ui.View(timeout=120)
+        select = discord.ui.Select(
+            placeholder="Choose an item to edit its price",
+            options=options,
+        )
+        parent = interaction
+        all_items = items
+        guild_ref = self.guild
+
+        async def on_select(inter2: discord.Interaction):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(select.values[0])
+            chosen = next((item for item in all_items if item["id"] == item_id), None)
+            if not chosen:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+
+            async def price_submit(inter3: discord.Interaction, value: str):
+                try:
+                    new_price = int(value.strip())
+                    if new_price <= 0:
+                        raise ValueError
+                except ValueError:
+                    await inter3.response.send_message(
+                        "❌ Price must be a positive whole number.",
+                        ephemeral=True,
+                    )
+                    return
+                db_set_shop_item_price(item_id, guild_ref.id, new_price)
+                await inter3.response.send_message(
+                    f"✅ **{chosen['name']}** price updated to **{cur(config, new_price)}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+
+            await inter2.response.send_modal(
+                Modal1(
+                    "Edit Item Price",
+                    label=f"New price in {config.get('currency_name') or 'Gems'}",
+                    placeholder="100",
+                    default=str(chosen["price"]),
+                    callback=price_submit,
+                )
+            )
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            "💰 Choose an item, then enter its new price.",
+            view=view,
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="⏳ Toggle Expiry Visibility", style=discord.ButtonStyle.grey, row=1)
     async def btn_toggle_expiry(self, interaction: discord.Interaction, btn):
@@ -5847,6 +5928,890 @@ class ConfigPermissionsMenu(_SubMenu):
 #  /admin — PANEL
 # ══════════════════════════════════════════════════════════════
 
+# ── Clean /config → Shop menus ─────────────────────────────────
+# The older shop view above is kept as a compatibility reference for
+# existing sessions, but all new /config panels use the grouped views below.
+
+def _shop_item_options(items: list, config: dict, description_fn=None) -> list:
+    options = []
+    for item in items[:25]:
+        description = description_fn(item) if description_fn else "Choose this item"
+        options.append(discord.SelectOption(
+            label=f"{item['name'][:70]}  —  {cur(config, item['price'])}"[:100],
+            description=str(description)[:100],
+            value=str(item["id"]),
+        ))
+    return options
+
+
+class ShopEditMenu(_SubMenu):
+    def build_embed(self, config: dict) -> discord.Embed:
+        items = db_get_shop_items(self.guild.id)
+        e = E("🛒 Shop · Edit Items", color=C_GOLD)
+        e.description = (
+            f"**{len(items)} item(s)** configured.\n"
+            "Choose an action below to update an existing item."
+        )
+        if items:
+            e.add_field(
+                name="Available actions",
+                value=(
+                    "✏️ Name and price\n"
+                    "🖼️ Image and provider\n"
+                    "⏳ Duration and listing expiry\n"
+                    "↕️ Display order"
+                ),
+                inline=False,
+            )
+        else:
+            e.description += "\nAdd an item first from the Shop menu."
+        return e
+
+    async def _pick_item(self, interaction, placeholder, description_fn, callback):
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        select = discord.ui.Select(
+            placeholder=placeholder,
+            options=_shop_item_options(items, config, description_fn),
+        )
+        view = discord.ui.View(timeout=120)
+
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            try:
+                item_id = int(select.values[0])
+                chosen = next((item for item in items if item["id"] == item_id), None)
+                if not chosen:
+                    await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                    return
+                await callback(interaction, inter2, chosen)
+            except Exception as exc:
+                print(f"[Shop edit select error] {exc}")
+                if not inter2.response.is_done():
+                    await inter2.response.send_message(
+                        "❌ Could not open the editor. Please try again.",
+                        ephemeral=True,
+                    )
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            f"🛒 {placeholder}.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="✏️ Edit Name", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_name(self, interaction, btn):
+        async def selected(parent, inter2, item):
+            async def submit(inter3, value):
+                new_name = value.strip()
+                if not new_name:
+                    await inter3.response.send_message("❌ Name cannot be empty.", ephemeral=True)
+                    return
+                db_set_shop_item_name(item["id"], self.guild.id, new_name)
+                await inter3.response.send_message(
+                    f"✅ Renamed to **{new_name}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Edit Item Name",
+                "New item name",
+                placeholder=item["name"][:100],
+                default=item["name"],
+                max_length=80,
+                callback=submit,
+            ))
+        await self._pick_item(
+            interaction,
+            "Choose an item to rename",
+            lambda item: "Edit the display name",
+            selected,
+        )
+
+    @discord.ui.button(label="💰 Edit Price", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_price(self, interaction, btn):
+        async def selected(parent, inter2, item):
+            config = db_get_config(self.guild.id)
+            async def submit(inter3, value):
+                try:
+                    price = int(value.strip())
+                    if price <= 0:
+                        raise ValueError
+                except ValueError:
+                    await inter3.response.send_message(
+                        "❌ Price must be a positive whole number.",
+                        ephemeral=True,
+                    )
+                    return
+                db_set_shop_item_price(item["id"], self.guild.id, price)
+                await inter3.response.send_message(
+                    f"✅ **{item['name']}** price updated to **{cur(config, price)}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Edit Item Price",
+                f"New price in {config.get('currency_name') or 'Gems'}",
+                placeholder="100",
+                default=str(item["price"]),
+                callback=submit,
+            ))
+        await self._pick_item(
+            interaction,
+            "Choose an item to edit its price",
+            lambda item: "Update the purchase price",
+            selected,
+        )
+
+    @discord.ui.button(label="🖼️ Set Image", style=discord.ButtonStyle.blurple, row=0)
+    async def btn_image(self, interaction, btn):
+        async def selected(parent, inter2, item):
+            async def submit(inter3, value):
+                value = value.strip()
+                db_update_shop_image(item["id"], self.guild.id, value or None)
+                await inter3.response.send_message(
+                    f"✅ Image {'updated' if value else 'removed'} for **{item['name']}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Edit Item Image",
+                "Image URL (empty = remove)",
+                placeholder="https://example.com/image.png",
+                default=item.get("image_url") or "",
+                required=False,
+                callback=submit,
+            ))
+        await self._pick_item(
+            interaction,
+            "Choose an item to edit its image",
+            lambda item: "Paste a direct image URL",
+            selected,
+        )
+
+    @discord.ui.button(label="🤝 Set Provider", style=discord.ButtonStyle.grey, row=1)
+    async def btn_provider(self, interaction, btn):
+        async def selected(parent, inter2, item):
+            async def submit(inter3, value):
+                value = value.strip()
+                conn = get_db()
+                conn.execute(
+                    "UPDATE shop_items SET provided_by=? WHERE id=? AND guild_id=?",
+                    (value or None, item["id"], self.guild.id),
+                )
+                conn.commit()
+                conn.close()
+                await inter3.response.send_message(
+                    f"✅ Provider {'updated' if value else 'removed'} for **{item['name']}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Edit Item Provider",
+                "Provided by (empty = remove)",
+                placeholder="Creator or server name",
+                default=item.get("provided_by") or "",
+                required=False,
+                callback=submit,
+            ))
+        await self._pick_item(
+            interaction,
+            "Choose an item to edit its provider",
+            lambda item: "Change the provider credit",
+            selected,
+        )
+
+    @discord.ui.button(label="⏳ Edit Duration", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_duration(self, interaction, btn):
+        async def selected(parent, inter2, item):
+            async def submit(inter3, value):
+                try:
+                    days = int(value.strip())
+                    if days < 0:
+                        raise ValueError
+                except ValueError:
+                    await inter3.response.send_message(
+                        "❌ Enter 0 (permanent) or a positive number of days.",
+                        ephemeral=True,
+                    )
+                    return
+                conn = get_db()
+                conn.execute(
+                    "UPDATE shop_items SET is_temporary=?, duration_days=? "
+                    "WHERE id=? AND guild_id=?",
+                    (1 if days else 0, days or None, item["id"], self.guild.id),
+                )
+                conn.commit()
+                conn.close()
+                status = "permanent" if not days else f"{days} days"
+                await inter3.response.send_message(
+                    f"✅ **{item['name']}** duration set to **{status}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Edit Item Duration",
+                "Duration in days (0 = permanent)",
+                placeholder="0 or 30",
+                default=str(item.get("duration_days") or 0),
+                callback=submit,
+            ))
+        await self._pick_item(
+            interaction,
+            "Choose an item to edit its duration",
+            lambda item: f"Current: {item.get('duration_days') or 0} day(s)",
+            selected,
+        )
+
+    @discord.ui.button(label="📅 Listing Expiry", style=discord.ButtonStyle.grey, row=1)
+    async def btn_listing_expiry(self, interaction, btn):
+        async def selected(parent, inter2, item):
+            current = (item.get("item_expires_at") or "")[:10]
+            async def submit(inter3, value):
+                value = value.strip()
+                conn = get_db()
+                if not value:
+                    conn.execute(
+                        "UPDATE shop_items SET item_expires_at=NULL WHERE id=? AND guild_id=?",
+                        (item["id"], self.guild.id),
+                    )
+                    message = f"✅ Listing expiry removed from **{item['name']}**."
+                else:
+                    try:
+                        from datetime import date as _date
+                        parsed = _date.fromisoformat(value)
+                    except ValueError:
+                        conn.close()
+                        await inter3.response.send_message(
+                            "❌ Use the date format **YYYY-MM-DD**.",
+                            ephemeral=True,
+                        )
+                        return
+                    conn.execute(
+                        "UPDATE shop_items SET item_expires_at=? WHERE id=? AND guild_id=?",
+                        (parsed.isoformat() + "T23:59:59", item["id"], self.guild.id),
+                    )
+                    message = f"✅ **{item['name']}** listing expires on **{parsed.isoformat()}**."
+                conn.commit()
+                conn.close()
+                await inter3.response.send_message(message, ephemeral=True)
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Listing Expiry",
+                "Date YYYY-MM-DD (empty = never)",
+                placeholder="2026-12-31",
+                default=current,
+                required=False,
+                callback=submit,
+            ))
+        await self._pick_item(
+            interaction,
+            "Choose an item to edit its listing expiry",
+            lambda item: f"Current: {(item.get('item_expires_at') or 'never')[:10]}",
+            selected,
+        )
+
+    @discord.ui.button(label="↕️ Reorder Items", style=discord.ButtonStyle.blurple, row=2)
+    async def btn_reorder(self, interaction, btn):
+        items = db_get_shop_items(self.guild.id)
+        if len(items) < 2:
+            await interaction.response.send_message(
+                "❌ Need at least 2 items to reorder.",
+                ephemeral=True,
+            )
+            return
+        config = db_get_config(self.guild.id)
+        select = discord.ui.Select(
+            placeholder="Choose an item to move",
+            options=[
+                discord.SelectOption(
+                    label=f"#{index}  {item['name'][:60]}  — {cur(config, item['price'])}",
+                    value=str(item["id"]),
+                )
+                for index, item in enumerate(items[:25], 1)
+            ],
+        )
+        view = discord.ui.View(timeout=120)
+        parent = interaction
+
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(select.values[0])
+            positions = discord.ui.Select(
+                placeholder="Choose the new position",
+                options=[
+                    discord.SelectOption(label=f"Position #{pos}", value=str(pos))
+                    for pos in range(1, min(len(items), 25) + 1)
+                ],
+            )
+            position_view = discord.ui.View(timeout=120)
+
+            async def on_position(inter3):
+                current = db_get_shop_items(self.guild.id)
+                moved = next((item for item in current if item["id"] == item_id), None)
+                ordered = [item for item in current if item["id"] != item_id]
+                new_position = int(positions.values[0])
+                if moved:
+                    ordered.insert(new_position - 1, moved)
+                    db_reorder_shop_items(
+                        self.guild.id,
+                        [item["id"] for item in ordered],
+                    )
+                await inter3.response.send_message(
+                    f"✅ **{moved['name'] if moved else 'Item'}** moved to position **#{new_position}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+
+            positions.callback = on_position
+            position_view.add_item(positions)
+            await inter2.response.send_message(
+                "↕️ Choose the new position.",
+                view=position_view,
+                ephemeral=True,
+            )
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            "↕️ Choose the item to move.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="← Back to Shop", style=discord.ButtonStyle.grey, row=2)
+    async def btn_shop(self, interaction, btn):
+        shop = ConfigShopMenu(self.guild, self.author_id)
+        await interaction.response.edit_message(
+            embed=shop.build_embed(db_get_config(self.guild.id)),
+            view=shop,
+        )
+
+
+class ShopOptionsMenu(_SubMenu):
+    def build_embed(self, config: dict) -> discord.Embed:
+        e = E("🛒 Shop · Item Options", color=C_GOLD)
+        e.description = (
+            "Control how items behave and what members can see in `/shop`.\n"
+            "These settings apply to one selected item at a time."
+        )
+        e.add_field(
+            name="Visibility",
+            value="Expiry, stock count, and purchase-limit display",
+            inline=False,
+        )
+        e.add_field(
+            name="Purchase rules",
+            value="Owner approval and per-member purchase limits",
+            inline=False,
+        )
+        return e
+
+    async def _toggle_item(self, interaction, placeholder, column, empty_message,
+                           enabled_text, disabled_text, filter_fn=None):
+        items = db_get_shop_items(self.guild.id)
+        if filter_fn:
+            items = [item for item in items if filter_fn(item)]
+        if not items:
+            await interaction.response.send_message(empty_message, ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        select = discord.ui.Select(
+            placeholder=placeholder,
+            options=_shop_item_options(items, config),
+        )
+        view = discord.ui.View(timeout=120)
+        parent = interaction
+
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(select.values[0])
+            chosen = next((item for item in items if item["id"] == item_id), None)
+            if not chosen:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+            new_value = 0 if chosen.get(column) else 1
+            conn = get_db()
+            conn.execute(
+                f"UPDATE shop_items SET {column}=? WHERE id=? AND guild_id=?",
+                (new_value, item_id, self.guild.id),
+            )
+            conn.commit()
+            conn.close()
+            message = enabled_text if new_value else disabled_text
+            await inter2.response.send_message(
+                f"{message} for **{chosen['name']}**.",
+                ephemeral=True,
+            )
+            await self._refresh(parent)
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            f"🛒 {placeholder}.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="⏳ Show/Hide Expiry", style=discord.ButtonStyle.grey, row=0)
+    async def btn_expiry_visibility(self, interaction, btn):
+        await self._toggle_item(
+            interaction,
+            "Choose a temporary item",
+            "show_duration",
+            "❌ No temporary items are configured.",
+            "👁️ Expiry is now shown",
+            "🔇 Expiry is now hidden",
+            lambda item: bool(item.get("is_temporary")),
+        )
+
+    @discord.ui.button(label="📦 Show/Hide Stock", style=discord.ButtonStyle.grey, row=0)
+    async def btn_stock_visibility(self, interaction, btn):
+        await self._toggle_item(
+            interaction,
+            "Choose an item with limited stock",
+            "show_stock",
+            "❌ No items have limited stock configured.",
+            "👁️ Stock count is now shown",
+            "🔇 Stock count is now hidden",
+            lambda item: item.get("stock") is not None,
+        )
+
+    @discord.ui.button(label="🔒 Require Approval", style=discord.ButtonStyle.grey, row=1)
+    async def btn_approval(self, interaction, btn):
+        await self._toggle_item(
+            interaction,
+            "Choose an item to toggle approval",
+            "requires_approval",
+            "❌ Shop is empty.",
+            "🔒 Owner approval is now required",
+            "🟢 Item is now instant purchase",
+        )
+
+    @discord.ui.button(label="🔢 Buy Limit", style=discord.ButtonStyle.grey, row=1)
+    async def btn_buy_limit(self, interaction, btn):
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        select = discord.ui.Select(
+            placeholder="Choose an item to set a purchase limit",
+            options=_shop_item_options(
+                items,
+                config,
+                lambda item: f"Current: {item.get('purchase_limit') or 'unlimited'}",
+            ),
+        )
+        view = discord.ui.View(timeout=120)
+        parent = interaction
+
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(select.values[0])
+            chosen = next((item for item in items if item["id"] == item_id), None)
+            if not chosen:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+            async def submit(inter3, value):
+                value = value.strip()
+                if not value or value == "0":
+                    limit = None
+                else:
+                    try:
+                        limit = int(value)
+                        if limit < 1:
+                            raise ValueError
+                    except ValueError:
+                        await inter3.response.send_message(
+                            "❌ Enter a positive number, or 0 for unlimited.",
+                            ephemeral=True,
+                        )
+                        return
+                conn = get_db()
+                conn.execute(
+                    "UPDATE shop_items SET purchase_limit=? WHERE id=? AND guild_id=?",
+                    (limit, item_id, self.guild.id),
+                )
+                conn.commit()
+                conn.close()
+                result = "unlimited" if limit is None else str(limit)
+                await inter3.response.send_message(
+                    f"✅ **{chosen['name']}** purchase limit set to **{result}** per member.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Purchase Limit",
+                "Max purchases per member (0 = unlimited)",
+                placeholder="1, 3, or 0",
+                default=str(chosen.get("purchase_limit") or ""),
+                required=False,
+                callback=submit,
+            ))
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            "🔢 Choose an item and set its purchase limit.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="← Back to Shop", style=discord.ButtonStyle.grey, row=2)
+    async def btn_shop(self, interaction, btn):
+        shop = ConfigShopMenu(self.guild, self.author_id)
+        await interaction.response.edit_message(
+            embed=shop.build_embed(db_get_config(self.guild.id)),
+            view=shop,
+        )
+
+
+class ShopRewardsMenu(_SubMenu):
+    def build_embed(self, config: dict) -> discord.Embed:
+        items = db_get_shop_items(self.guild.id)
+        e = E("🛒 Shop · Rewards & Stock", color=C_GOLD)
+        e.description = (
+            "Pre-load links or codes so purchases can receive a reward automatically."
+        )
+        if items:
+            e.add_field(
+                name="Current reward stock",
+                value="\n".join(
+                    f"**{item['name']}** — 🔑 {db_count_available_rewards(item['id'], self.guild.id)} available"
+                    for item in items[:10]
+                )[:1024],
+                inline=False,
+            )
+        else:
+            e.description += "\nAdd an item first from the Shop menu."
+        return e
+
+    @discord.ui.button(label="🔑 Add Rewards", style=discord.ButtonStyle.green, row=0)
+    async def btn_add_rewards(self, interaction, btn):
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        select = discord.ui.Select(
+            placeholder="Choose an item to add rewards",
+            options=_shop_item_options(
+                items,
+                config,
+                lambda item: f"{db_count_available_rewards(item['id'], self.guild.id)} available",
+            ),
+        )
+        view = discord.ui.View(timeout=120)
+        parent = interaction
+
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item_id = int(select.values[0])
+            chosen = next((item for item in items if item["id"] == item_id), None)
+            if not chosen:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+            async def submit(inter3, value):
+                entries = [line.strip() for line in value.splitlines() if line.strip()]
+                if not entries:
+                    entries = [entry.strip() for entry in value.split() if entry.strip()]
+                if not entries:
+                    await inter3.response.send_message("❌ No valid rewards entered.", ephemeral=True)
+                    return
+                for entry in entries:
+                    db_add_item_reward(item_id, self.guild.id, entry)
+                await inter3.response.send_message(
+                    f"✅ Added **{len(entries)}** reward(s) to **{chosen['name']}**.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                "Add Item Rewards",
+                "One reward per line",
+                placeholder="CODE-ABC or https://example.com/reward",
+                max_length=4000,
+                paragraph=True,
+                callback=submit,
+            ))
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            "🔑 Choose an item, then enter one reward per line.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="📊 Stock Overview", style=discord.ButtonStyle.grey, row=0)
+    async def btn_stock(self, interaction, btn):
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
+            return
+        lines = []
+        for item in items:
+            rewards = db_get_item_rewards(item["id"], self.guild.id)
+            available = db_count_available_rewards(item["id"], self.guild.id)
+            used = sum(1 for reward in rewards if reward["used"])
+            lines.append(
+                f"**{item['name']}** — {available} available / {used} used"
+                if rewards else f"**{item['name']}** — no pre-loaded rewards"
+            )
+        await interaction.response.send_message(
+            embed=E("📊 Reward Stock Overview", "\n".join(lines)[:4000], C_GOLD),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="← Back to Shop", style=discord.ButtonStyle.grey, row=1)
+    async def btn_shop(self, interaction, btn):
+        shop = ConfigShopMenu(self.guild, self.author_id)
+        await interaction.response.edit_message(
+            embed=shop.build_embed(db_get_config(self.guild.id)),
+            view=shop,
+        )
+
+
+class ConfigShopMenu(_SubMenu):
+    def build_embed(self, config: dict) -> discord.Embed:
+        items = db_get_shop_items(self.guild.id)
+        c_name = config.get("currency_name") or "Gems"
+        e = E("🛒 Shop Settings", color=C_GOLD)
+        e.description = (
+            f"Manage the member shop in one place.\n"
+            f"**{len(items)} item(s)** configured using {c_name}."
+        )
+        if items:
+            for item in items[:8]:
+                tags = []
+                if item.get("is_temporary"):
+                    tags.append(f"⏳ {item.get('duration_days')}d")
+                if item.get("image_url"):
+                    tags.append("🖼️")
+                if item.get("requires_text"):
+                    tags.append("📝")
+                e.add_field(
+                    name=item["name"],
+                    value=f"**{cur(config, item['price'])}**"
+                    + (f" · {' '.join(tags)}" if tags else ""),
+                    inline=True,
+                )
+            if len(items) > 8:
+                e.add_field(
+                    name="More items",
+                    value=f"{len(items) - 8} more — use **View All**.",
+                    inline=False,
+                )
+        else:
+            e.add_field(
+                name="Getting started",
+                value="Use **Add Item** to create the first shop item.",
+                inline=False,
+            )
+        e.set_footer(text="Use the grouped menus below to keep shop management simple.")
+        return e
+
+    async def _open(self, interaction, view):
+        await interaction.response.edit_message(
+            embed=view.build_embed(db_get_config(self.guild.id)),
+            view=view,
+        )
+
+    @discord.ui.button(label="➕ Add Item", style=discord.ButtonStyle.green, row=0)
+    async def btn_add(self, interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, name, price, stock, duration, text_label):
+            try:
+                parsed_price = int(price)
+                parsed_duration = int(duration)
+                parsed_stock = int(stock.strip()) if stock.strip() else 0
+                if parsed_price <= 0 or parsed_duration < 0 or parsed_stock < 0:
+                    raise ValueError
+            except ValueError:
+                await inter.response.send_message(
+                    "❌ Price must be positive; duration and stock must be 0 or greater.",
+                    ephemeral=True,
+                )
+                return
+            item_id = db_add_shop_item(
+                self.guild.id,
+                name.strip(),
+                parsed_price,
+                None,
+                1 if parsed_duration else 0,
+                parsed_duration or None,
+                1,
+                1 if text_label.strip() else 0,
+                text_label.strip() or None,
+                stock=parsed_stock or None,
+            )
+            await inter.response.send_message(
+                f"✅ Added **{name.strip()}** for **{cur(config, parsed_price)}** "
+                f"(ID: `{item_id}`).\n"
+                "Use **Edit Items → Set Image** if you want to add an image.",
+                ephemeral=True,
+            )
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal5(
+            "Add Shop Item",
+            currency_label=config.get("currency_name") or "Gems",
+            callback=submit,
+        ))
+
+    @discord.ui.button(label="🗑️ Remove Item", style=discord.ButtonStyle.red, row=0)
+    async def btn_remove(self, interaction, btn):
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("❌ Shop is already empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        select = discord.ui.Select(
+            placeholder="Choose an item to remove",
+            options=_shop_item_options(items, config, lambda item: "Permanently delete this item"),
+        )
+        view = discord.ui.View(timeout=120)
+
+        async def on_select(inter2):
+            if inter2.user.id != self.author_id:
+                await inter2.response.send_message("❌ Not your panel.", ephemeral=True)
+                return
+            item = db_get_shop_item(int(select.values[0]), self.guild.id)
+            if not item:
+                await inter2.response.send_message("❌ Item not found.", ephemeral=True)
+                return
+            confirm = ConfirmView(self.author_id)
+            await inter2.response.send_message(
+                f"⚠️ Remove **{item['name']}** permanently?",
+                view=confirm,
+                ephemeral=True,
+            )
+            await confirm.wait()
+            if confirm.value:
+                db_remove_shop_item(item["id"], self.guild.id)
+                await inter2.followup.send("✅ Item removed.", ephemeral=True)
+                await self._refresh(interaction)
+            else:
+                await inter2.followup.send("Cancelled.", ephemeral=True)
+
+        select.callback = on_select
+        view.add_item(select)
+        await interaction.response.send_message(
+            "🗑️ Choose the item to remove.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="📋 View All", style=discord.ButtonStyle.grey, row=0)
+    async def btn_view(self, interaction, btn):
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.response.send_message("The shop is empty.", ephemeral=True)
+            return
+        config = db_get_config(self.guild.id)
+        lines = []
+        for item in items:
+            tags = []
+            if item.get("is_temporary"):
+                tags.append(f"⏳{item.get('duration_days')}d")
+            if item.get("requires_text"):
+                tags.append("📝")
+            if item.get("image_url"):
+                tags.append("🖼️")
+            if item.get("requires_approval"):
+                tags.append("🔒")
+            if item.get("purchase_limit"):
+                tags.append(f"🔢{item['purchase_limit']}")
+            lines.append(
+                f"`{item['id']}` **{item['name']}** — {cur(config, item['price'])}"
+                + (f"  {' '.join(tags)}" if tags else "")
+            )
+        await interaction.response.send_message(
+            embed=E("🛒 All Shop Items", "\n".join(lines)[:4000], C_GOLD),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="✏️ Edit Items", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_edit(self, interaction, btn):
+        await self._open(interaction, ShopEditMenu(self.guild, self.author_id))
+
+    @discord.ui.button(label="⚙️ Item Options", style=discord.ButtonStyle.blurple, row=1)
+    async def btn_options(self, interaction, btn):
+        await self._open(interaction, ShopOptionsMenu(self.guild, self.author_id))
+
+    @discord.ui.button(label="🔑 Rewards & Stock", style=discord.ButtonStyle.green, row=1)
+    async def btn_rewards(self, interaction, btn):
+        await self._open(interaction, ShopRewardsMenu(self.guild, self.author_id))
+
+    @discord.ui.button(label="🔄 Post Shop Now", style=discord.ButtonStyle.green, row=2)
+    async def btn_post(self, interaction, btn):
+        # Reuse the existing posting implementation through the same
+        # configured channels, without exposing shop management in /admin.
+        await interaction.response.defer(ephemeral=True)
+        config = db_get_config(self.guild.id)
+        items = db_get_shop_items(self.guild.id)
+        if not items:
+            await interaction.followup.send("❌ The shop is empty — add items first.", ephemeral=True)
+            return
+        channel_id = (
+            config.get("daily_shop_channel_id")
+            or config.get("shop_channel_id")
+            or config.get("commands_channel_id")
+        )
+        channel = interaction.client.get_channel(channel_id) if channel_id else None
+        if not channel:
+            await interaction.followup.send(
+                "❌ No shop channel configured. Set one in `/config → 💬 Channels`.",
+                ephemeral=True,
+            )
+            return
+        currency_name = config.get("currency_name") or "Gems"
+        currency_emoji = config.get("currency_emoji") or "💎"
+        shop_channel = config.get("shop_channel_id") or config.get("commands_channel_id")
+        embeds = [discord.Embed(
+            title="🛍️ Shop Update",
+            description=f"Use `/shop` in <#{shop_channel}> to buy!",
+            color=C_GOLD,
+        )]
+        now_iso = datetime.utcnow().isoformat()
+        for item in items:
+            if item.get("item_expires_at") and item["item_expires_at"] < now_iso:
+                continue
+            embed = discord.Embed(
+                title=item["name"],
+                description=f"{currency_emoji} **{item['price']:,} {currency_name}**",
+                color=C_GOLD,
+            )
+            if item.get("image_url"):
+                embed.set_thumbnail(url=item["image_url"])
+            embeds.append(embed)
+        try:
+            for start in range(0, len(embeds), 10):
+                await channel.send(embeds=embeds[start:start + 10])
+            await interaction.followup.send(
+                f"✅ Shop posted to <#{channel.id}>.",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"❌ Missing permission to post in <#{channel.id}>.",
+                ephemeral=True,
+            )
+
 # ══════════════════════════════════════════════════════════════
 #  COMMUNITY CONFIG SUBMENU (Boost Announce + Revive Ping)
 # ══════════════════════════════════════════════════════════════
@@ -6143,11 +7108,6 @@ class AdminMainMenu(discord.ui.View):
                         value=f"[{current['video_title']}]({make_shorts_url(current['video_id'])})", inline=False)
         await i.response.send_message(embed=e, ephemeral=True)
 
-    @discord.ui.button(label="🛒 Manage Shop",      style=discord.ButtonStyle.blurple, row=1)
-    async def cat_shop(self, i: discord.Interaction, b):
-        sub = AdminShopMenu(self.guild, self.author_id)
-        await i.response.edit_message(embed=sub.build_embed(), view=sub)
-
     @discord.ui.button(label="🏁 Community Goals", style=discord.ButtonStyle.grey,   row=1)
     async def cat_goals(self, i: discord.Interaction, b):
         goals = db_get_community_goals(self.guild.id)
@@ -6414,7 +7374,7 @@ class AdminXPMenu(discord.ui.View):
         await interaction.response.send_modal(Modal1("Check Member Balance", "Member mention or ID",
             placeholder="@username  or  1234567890", callback=submit))
 
-class AdminShopMenu(discord.ui.View):
+class LegacyAdminShopMenu(discord.ui.View):
     def __init__(self, guild, author_id):
         super().__init__(timeout=300)
         self.guild = guild
@@ -7108,7 +8068,7 @@ class ShopView(discord.ui.View):
         if not self.items:
             header.description = (
                 f"Your balance: **{c_emoji} {user_bal:,} {c_name}**\n\n"
-                "⚠️ The shop is empty. Ask a manager to add items via `/admin`."
+                "⚠️ The shop is empty. Ask a manager to add items via `/config → 🛒 Shop`."
             )
             return [header]
 
