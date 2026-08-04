@@ -3911,7 +3911,7 @@ class ConfigDMsMenu(_SubMenu):
         e.add_field(name="🔕 Notif Prompt Cooldown",    value=f"**{notif_label}**", inline=True)
         bulk_dm_role = config.get("bulk_dm_role_id")
         e.add_field(name="📨 Bulk DM Role",              value=_role(bulk_dm_role) if bulk_dm_role else "`Not set`", inline=True)
-        e.add_field(name="\u200b", value=(
+        e.description = (
             "**Welcome DM** — bot DMs new members when they join\n"
             "**DM Role Filter** — (unused on join, only for reference)\n"
             "**DM on Role Assign** — DM when a member receives this specific role (independent of Welcome DM toggle)\n"
@@ -3927,7 +3927,7 @@ class ConfigDMsMenu(_SubMenu):
             "**Notif Prompt Cooldown** — days before the 🔔 notification prompt reappears after 'Later'\n"
             "**Bulk DM Role** — role whose members receive the welcome DM when you press **📨 Send DMs** below\n"
             "➡️ Gift Gems settings moved to **🎁 Gift Gems** in the main /config menu."
-        ), inline=False)
+        )
         return e
 
     def _parse_role(self, value: str):
