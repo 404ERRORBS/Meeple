@@ -3289,27 +3289,28 @@ class ConfigMainMenu(discord.ui.View):
 
     @discord.ui.button(label="📨 DMs & Welcome",style=discord.ButtonStyle.blurple, row=2)
     async def cat_dms(self, i, b):
-        # Acknowledge immediately, then render the submenu inside this fresh
-        # ephemeral response. This prevents an embed/view construction error
-        # from becoming Discord's generic "didn't respond" state.
-        try:
-            await i.response.send_message("⏳ Opening **DMs & Welcome**…", ephemeral=True)
-        except Exception as ex:
-            traceback.print_exception(type(ex), ex, ex.__traceback__)
-            return
+        # Send the complete submenu as the component response. Avoid a second
+        # edit request on an ephemeral response: Discord clients and webhook
+        # tokens can reject that follow-up edit even though the first response
+        # succeeded.
         try:
             sub = ConfigDMsMenu(self.guild, self.author_id)
             embed = sub.build_embed(db_get_config(self.guild.id))
-            await i.edit_original_response(content=None, embed=embed, view=sub)
+            await i.response.send_message(embed=embed, view=sub, ephemeral=True)
         except Exception as ex:
             traceback.print_exception(type(ex), ex, ex.__traceback__)
             try:
-                await i.edit_original_response(
-                    content="❌ DMs & Welcome could not be opened. "
-                            "The error was logged; please try again.",
-                    embed=None,
-                    view=None,
-                )
+                if not i.response.is_done():
+                    await i.response.send_message(
+                        "❌ DMs & Welcome could not be opened. "
+                        "The error was logged; please try again.",
+                        ephemeral=True,
+                    )
+                else:
+                    await i.followup.send(
+                        "❌ DMs & Welcome could not be opened. Please try again.",
+                        ephemeral=True,
+                    )
             except Exception:
                 pass
 
