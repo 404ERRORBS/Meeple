@@ -31,12 +31,77 @@ import json
 import shutil
 import random
 import traceback
+import logging
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web as aiohttp_web
 import hmac
 import hashlib
+
+# ══════════════════════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════════════════════
+
+LOG_PATH = os.environ.get("BOT_LOG_PATH", "bot.log")
+logger = logging.getLogger("meeple_bot")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    _log_formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s — %(message)s",
+        "%Y-%m-%d %H:%M:%S UTC",
+    )
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(_log_formatter)
+    logger.addHandler(_console_handler)
+    try:
+        _file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        _file_handler.setFormatter(_log_formatter)
+        logger.addHandler(_file_handler)
+    except OSError as _log_setup_error:
+        # Console logging must still work if the deployment directory is
+        # read-only. The exception is intentionally not fatal.
+        print(f"[Logging] Could not open {LOG_PATH}: {_log_setup_error}", flush=True)
+
+def _flush_logs() -> None:
+    for _handler in logger.handlers:
+        try:
+            _handler.flush()
+        except Exception:
+            pass
+
+def _log_exception(context: str, error: BaseException, **details) -> str:
+    """Log an exception to both platform logs and bot.log, then return an ID."""
+    error_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    message = f"[{error_id}] {context}"
+    if detail_text:
+        message += f" | {detail_text}"
+    try:
+        logger.error(
+            "%s | %s: %s",
+            message,
+            type(error).__name__,
+            str(error) or repr(error),
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        _flush_logs()
+    except Exception:
+        # Last-resort write: preserve the diagnostic even if logging itself
+        # was misconfigured.
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as _fallback_log:
+                _fallback_log.write(
+                    f"{message} | {type(error).__name__}: "
+                    f"{str(error) or repr(error)}\n"
+                )
+                traceback.print_exception(
+                    type(error), error, error.__traceback__, file=_fallback_log
+                )
+        except Exception:
+            pass
+    return error_id
 
 # ══════════════════════════════════════════════════════════════
 #  IMAGE-ATTACHMENT HELPER
@@ -3293,26 +3358,84 @@ class ConfigMainMenu(discord.ui.View):
         # edit request on an ephemeral response: Discord clients and webhook
         # tokens can reject that follow-up edit even though the first response
         # succeeded.
+        logger.info(
+            "DMs & Welcome button clicked | guild_id=%s user_id=%s",
+            self.guild.id,
+            self.author_id,
+        )
+        _flush_logs()
         try:
             sub = ConfigDMsMenu(self.guild, self.author_id)
             embed = sub.build_embed(db_get_config(self.guild.id))
-            await i.response.send_message(embed=embed, view=sub, ephemeral=True)
+            logger.info(
+                "DMs & Welcome panel built | guild_id=%s fields=%s buttons=%s",
+                self.guild.id,
+                len(embed.fields),
+                len(sub.children),
+            )
+            _flush_logs()
         except Exception as ex:
-            traceback.print_exception(type(ex), ex, ex.__traceback__)
+            error_id = _log_exception(
+                "DMs & Welcome panel construction failed",
+                ex,
+                guild_id=self.guild.id,
+                user_id=self.author_id,
+            )
+            try:
+                await i.response.send_message(
+                    f"❌ DMs & Welcome could not be opened. "
+                    f"Error ID: `{error_id}`\n"
+                    f"`{type(ex).__name__}: {str(ex)[:700] or repr(ex)[:700]}`",
+                    ephemeral=True,
+                )
+            except Exception as report_ex:
+                _log_exception(
+                    "Could not report DMs panel construction failure",
+                    report_ex,
+                    guild_id=self.guild.id,
+                    user_id=self.author_id,
+                    error_id=error_id,
+                )
+            return
+
+        try:
+            await i.response.send_message(embed=embed, view=sub, ephemeral=True)
+            logger.info(
+                "DMs & Welcome panel sent successfully | guild_id=%s user_id=%s",
+                self.guild.id,
+                self.author_id,
+            )
+            _flush_logs()
+        except Exception as ex:
+            error_id = _log_exception(
+                "DMs & Welcome panel Discord response failed",
+                ex,
+                guild_id=self.guild.id,
+                user_id=self.author_id,
+                button_response_done=i.response.is_done(),
+            )
             try:
                 if not i.response.is_done():
                     await i.response.send_message(
-                        "❌ DMs & Welcome could not be opened. "
-                        "The error was logged; please try again.",
+                        f"❌ DMs & Welcome could not be opened. "
+                        f"Error ID: `{error_id}`\n"
+                        f"`{type(ex).__name__}: {str(ex)[:700] or repr(ex)[:700]}`",
                         ephemeral=True,
                     )
                 else:
                     await i.followup.send(
-                        "❌ DMs & Welcome could not be opened. Please try again.",
+                        f"❌ DMs & Welcome could not be opened. "
+                        f"Error ID: `{error_id}`",
                         ephemeral=True,
                     )
-            except Exception:
-                pass
+            except Exception as report_ex:
+                _log_exception(
+                    "Could not report DMs panel response failure",
+                    report_ex,
+                    guild_id=self.guild.id,
+                    user_id=self.author_id,
+                    error_id=error_id,
+                )
 
     @discord.ui.button(label="🔔 Community",    style=discord.ButtonStyle.blurple, row=2)
     async def cat_community(self, i, b):
@@ -11182,6 +11305,12 @@ async def start_web_server() -> None:
 
 async def _main():
     """Async entry point: web server + bot share the same event loop."""
+    logger.info(
+        "Logging initialized | cwd=%s log_path=%s",
+        os.getcwd(),
+        os.path.abspath(LOG_PATH),
+    )
+    _flush_logs()
     init_db()
     await start_web_server()
     token = os.environ.get("TOKEN")

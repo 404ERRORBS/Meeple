@@ -52,6 +52,19 @@ The bot stores its SQLite database (`bot_data.db`) on disk.
 ### 5. Configure the Bot (Discord)
 Use `/config` to set up channels, roles, and features for each server.
 
+### Troubleshooting logs
+The bot writes diagnostics to the platform console and to `bot.log` in its
+working directory. The log file is excluded from Git by `.gitignore`.
+For the `/config → DMs & Welcome` button, look for:
+
+- `DMs & Welcome button clicked`
+- `DMs & Welcome panel built`
+- `DMs & Welcome panel sent successfully`
+- or an error entry containing an `Error ID`
+
+If the error message in Discord includes an `Error ID`, search for that exact
+ID in the Render service logs or in `bot.log`.
+
 ---
 
 ## Environment Variables
