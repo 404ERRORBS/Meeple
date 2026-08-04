@@ -3178,7 +3178,7 @@ class AdminTutorialView(PagedTutorialView):
 
 class ConfigMainMenu(discord.ui.View):
     def __init__(self, guild: discord.Guild, author_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=1800)
         self.guild = guild
         self.author_id = author_id
 
@@ -3289,33 +3289,27 @@ class ConfigMainMenu(discord.ui.View):
 
     @discord.ui.button(label="📨 DMs & Welcome",style=discord.ButtonStyle.blurple, row=2)
     async def cat_dms(self, i, b):
-        # Open the submenu as a fresh ephemeral response. Do not defer and then
-        # use a follow-up here: some Discord clients keep the component in a
-        # loading state when the original /config response is ephemeral.
+        # Acknowledge immediately, then render the submenu inside this fresh
+        # ephemeral response. This prevents an embed/view construction error
+        # from becoming Discord's generic "didn't respond" state.
+        try:
+            await i.response.send_message("⏳ Opening **DMs & Welcome**…", ephemeral=True)
+        except Exception as ex:
+            traceback.print_exception(type(ex), ex, ex.__traceback__)
+            return
         try:
             sub = ConfigDMsMenu(self.guild, self.author_id)
             embed = sub.build_embed(db_get_config(self.guild.id))
+            await i.edit_original_response(content=None, embed=embed, view=sub)
         except Exception as ex:
             traceback.print_exception(type(ex), ex, ex.__traceback__)
             try:
-                await i.response.send_message(
-                    "❌ DMs & Welcome could not be opened. "
-                    "The error was logged; please try again.",
-                    ephemeral=True,
+                await i.edit_original_response(
+                    content="❌ DMs & Welcome could not be opened. "
+                            "The error was logged; please try again.",
+                    embed=None,
+                    view=None,
                 )
-            except Exception:
-                pass
-            return
-        try:
-            await i.response.send_message(embed=embed, view=sub, ephemeral=True)
-        except Exception as ex:
-            traceback.print_exception(type(ex), ex, ex.__traceback__)
-            try:
-                if i.response.is_done():
-                    await i.followup.send(
-                        "❌ DMs & Welcome could not be opened. Please try again.",
-                        ephemeral=True,
-                    )
             except Exception:
                 pass
 
@@ -3330,7 +3324,7 @@ class ConfigMainMenu(discord.ui.View):
 
 class _SubMenu(discord.ui.View):
     def __init__(self, guild: discord.Guild, author_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=1800)
         self.guild = guild
         self.author_id = author_id
 
