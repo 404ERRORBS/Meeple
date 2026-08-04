@@ -3289,23 +3289,33 @@ class ConfigMainMenu(discord.ui.View):
 
     @discord.ui.button(label="📨 DMs & Welcome",style=discord.ButtonStyle.blurple, row=2)
     async def cat_dms(self, i, b):
-        # Acknowledge before building the embed. Older persisted configuration
-        # values must never turn a component error into "didn't respond".
+        # Open the submenu as a fresh ephemeral response. Do not defer and then
+        # use a follow-up here: some Discord clients keep the component in a
+        # loading state when the original /config response is ephemeral.
         try:
-            await i.response.defer()
             sub = ConfigDMsMenu(self.guild, self.author_id)
-            await i.edit_original_response(
-                embed=sub.build_embed(db_get_config(self.guild.id)),
-                view=sub,
-            )
+            embed = sub.build_embed(db_get_config(self.guild.id))
         except Exception as ex:
             traceback.print_exception(type(ex), ex, ex.__traceback__)
             try:
-                await i.followup.send(
+                await i.response.send_message(
                     "❌ DMs & Welcome could not be opened. "
                     "The error was logged; please try again.",
                     ephemeral=True,
                 )
+            except Exception:
+                pass
+            return
+        try:
+            await i.response.send_message(embed=embed, view=sub, ephemeral=True)
+        except Exception as ex:
+            traceback.print_exception(type(ex), ex, ex.__traceback__)
+            try:
+                if i.response.is_done():
+                    await i.followup.send(
+                        "❌ DMs & Welcome could not be opened. Please try again.",
+                        ephemeral=True,
+                    )
             except Exception:
                 pass
 
