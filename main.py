@@ -411,6 +411,7 @@ def init_db():
         event_type  TEXT,
         start_date  TEXT,
         end_date    TEXT,
+        duration_days INTEGER DEFAULT 30,
         config_json TEXT DEFAULT '{}',
         enabled     INTEGER DEFAULT 1
     )""")
@@ -427,6 +428,30 @@ def init_db():
         contributors TEXT    DEFAULT '[]',
         completed    INTEGER DEFAULT 0,
         enabled      INTEGER DEFAULT 1
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS giveaways (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id     INTEGER NOT NULL,
+        channel_id   INTEGER NOT NULL,
+        message_id   INTEGER,
+        host_id      INTEGER NOT NULL,
+        title        TEXT NOT NULL,
+        description  TEXT DEFAULT '',
+        reward_type  TEXT NOT NULL,
+        reward_value INTEGER NOT NULL,
+        end_at       TEXT NOT NULL,
+        status       TEXT DEFAULT 'active',
+        winner_id    INTEGER,
+        reward_text  TEXT,
+        created_at   TEXT DEFAULT (datetime('now'))
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS giveaway_entries (
+        giveaway_id INTEGER NOT NULL,
+        user_id     INTEGER NOT NULL,
+        entered_at  TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (giveaway_id, user_id)
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS invites_cache (
@@ -510,6 +535,9 @@ def init_db():
         "ALTER TABLE guild_config ADD COLUMN currency_name TEXT DEFAULT 'Gems'",
         "ALTER TABLE guild_config ADD COLUMN currency_emoji TEXT DEFAULT '💎'",
         "ALTER TABLE guild_config ADD COLUMN event_announce_channel_id INTEGER",
+        "ALTER TABLE guild_config ADD COLUMN giveaway_channel_id INTEGER",
+        "ALTER TABLE guild_config ADD COLUMN giveaway_role_id INTEGER",
+        "ALTER TABLE events ADD COLUMN duration_days INTEGER DEFAULT 30",
         "ALTER TABLE guild_config ADD COLUMN ticket_category_id INTEGER",
         # Purchase DM controls
         "ALTER TABLE guild_config ADD COLUMN purchase_dm_enabled INTEGER DEFAULT 1",
@@ -764,10 +792,10 @@ def render_dm_template(template: Optional[str], variables: dict, default: str) -
 
 
 def format_reward_for_discord(reward_text: str) -> str:
-    """Make URLs clickable while keeping non-URL rewards safe and readable."""
+    """Show complete reward URLs while keeping non-URL rewards safe and readable."""
     value = str(reward_text).strip()
     if re.fullmatch(r"https?://\S+", value):
-        return f"[Open reward]({value})"
+        return value
     return f"```\n{value[:1900]}\n```"
 
 
@@ -1752,19 +1780,46 @@ def db_ensure_achievement_config(guild_id: int):
 
 # ── Event helpers ──────────────────────────────────────────────
 
+def event_start(event: dict) -> datetime:
+    """Return an event start, supporting legacy calendar-based rows."""
+    try:
+        return datetime.fromisoformat(event["start_date"])
+    except (TypeError, ValueError):
+        return datetime.now()
+
+def event_end(event: dict) -> datetime:
+    """Return an event end, preferring the relative duration field."""
+    start = event_start(event)
+    try:
+        days = int(event.get("duration_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days > 0:
+        return start + timedelta(days=days)
+    try:
+        return datetime.fromisoformat(event["end_date"])
+    except (TypeError, ValueError):
+        return start
+
+def event_duration_label(event: dict) -> str:
+    try:
+        days = int(event.get("duration_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days > 0:
+        return f"{days} day(s)"
+    return "legacy duration"
+
 def db_get_active_events(guild_id: int) -> list:
-    now = datetime.now().isoformat()
+    now = datetime.now()
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM events WHERE guild_id=? AND enabled=1 AND start_date<=? AND end_date>=?",
-        (guild_id, now, now)
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM events WHERE guild_id=? AND enabled=1", (guild_id,)).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows if event_start(dict(r)) <= now <= event_end(dict(r))]
 
 def db_get_all_events(guild_id: int) -> list:
     conn = get_db()
-    rows = conn.execute("SELECT * FROM events WHERE guild_id=? ORDER BY start_date DESC", (guild_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM events WHERE guild_id=? ORDER BY id DESC", (guild_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -1782,13 +1837,27 @@ def db_has_double_xp(guild_id: int) -> float:
 
 def db_get_community_goals(guild_id: int, event_id: int = None) -> list:
     conn = get_db()
+    query = (
+        "SELECT g.*, e.start_date, e.end_date, e.duration_days, e.enabled AS event_enabled "
+        "FROM community_goals g LEFT JOIN events e ON e.id=g.event_id "
+        "WHERE g.guild_id=? AND g.enabled=1"
+    )
+    params = [guild_id]
     if event_id:
-        rows = conn.execute("SELECT * FROM community_goals WHERE guild_id=? AND event_id=? AND enabled=1",
-                            (guild_id, event_id)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM community_goals WHERE guild_id=? AND enabled=1", (guild_id,)).fetchall()
+        query += " AND g.event_id=?"
+        params.append(event_id)
+    rows = conn.execute(query, params).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    now = datetime.now()
+    goals = []
+    for row in rows:
+        goal = dict(row)
+        if goal.get("event_enabled", 1) and (
+            not goal.get("start_date")
+            or event_start(goal) <= now <= event_end(goal)
+        ):
+            goals.append(goal)
+    return goals
 
 def db_add_goal_contribution(guild_id: int, goal_id: int, user_id: int, amount: int = 1) -> dict:
     """Add user contribution to a community goal. Returns updated goal."""
@@ -1802,7 +1871,8 @@ def db_add_goal_contribution(guild_id: int, goal_id: int, user_id: int, amount: 
     if user_id not in contribs:
         contribs.append(user_id)
     new_current = goal["current"] + amount
-    completed = 1 if new_current >= goal["target"] and not goal["completed"] else goal["completed"]
+    newly_completed = bool(new_current >= goal["target"] and not goal["completed"])
+    completed = 1 if newly_completed else goal["completed"]
     conn.execute(
         "UPDATE community_goals SET current=?, contributors=?, completed=? WHERE id=?",
         (new_current, json.dumps(contribs), completed, goal_id)
@@ -1811,8 +1881,129 @@ def db_add_goal_contribution(guild_id: int, goal_id: int, user_id: int, amount: 
     goal["current"] = new_current
     goal["contributors"] = contribs
     goal["completed"] = completed
+    goal["newly_completed"] = newly_completed
     conn.close()
     return goal
+
+def db_create_giveaway(guild_id: int, channel_id: int, host_id: int, title: str,
+                       description: str, reward_type: str, reward_value: int,
+                       end_at: str) -> int:
+    conn = get_db()
+    row = conn.execute(
+        "INSERT INTO giveaways "
+        "(guild_id, channel_id, host_id, title, description, reward_type, reward_value, end_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (guild_id, channel_id, host_id, title, description, reward_type, reward_value, end_at),
+    )
+    giveaway_id = row.lastrowid
+    conn.commit()
+    conn.close()
+    return giveaway_id
+
+def db_get_giveaway(giveaway_id: int, guild_id: int | None = None) -> dict | None:
+    conn = get_db()
+    if guild_id is None:
+        row = conn.execute("SELECT * FROM giveaways WHERE id=?", (giveaway_id,)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM giveaways WHERE id=? AND guild_id=?", (giveaway_id, guild_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def db_set_giveaway_message(giveaway_id: int, message_id: int):
+    conn = get_db()
+    conn.execute("UPDATE giveaways SET message_id=? WHERE id=?", (message_id, giveaway_id))
+    conn.commit()
+    conn.close()
+
+def db_mark_giveaway_failed(giveaway_id: int):
+    conn = get_db()
+    conn.execute("UPDATE giveaways SET status='failed' WHERE id=? AND status='active'", (giveaway_id,))
+    conn.commit()
+    conn.close()
+
+def db_get_active_giveaways() -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM giveaways WHERE status='active'").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def db_enter_giveaway(giveaway_id: int, user_id: int) -> tuple[bool, int]:
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT status, end_at FROM giveaways WHERE id=?", (giveaway_id,)
+        ).fetchone()
+        if not row or row["status"] != "active" or datetime.fromisoformat(row["end_at"]) <= datetime.now():
+            return False, 0
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO giveaway_entries (giveaway_id, user_id) VALUES (?,?)",
+            (giveaway_id, user_id),
+        ).rowcount
+        count = conn.execute(
+            "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=?", (giveaway_id,)
+        ).fetchone()[0]
+        conn.commit()
+        return bool(inserted), count
+    finally:
+        conn.close()
+
+def db_draw_giveaway(giveaway_id: int) -> dict | None:
+    """Close a giveaway and atomically reserve its winner/reward."""
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        giveaway = conn.execute("SELECT * FROM giveaways WHERE id=?", (giveaway_id,)).fetchone()
+        if not giveaway or giveaway["status"] != "active":
+            conn.rollback()
+            return None
+        entries = conn.execute(
+            "SELECT user_id FROM giveaway_entries WHERE giveaway_id=?", (giveaway_id,)
+        ).fetchall()
+        if not entries:
+            conn.execute(
+                "UPDATE giveaways SET status='ended' WHERE id=?", (giveaway_id,)
+            )
+            conn.commit()
+            return {**dict(giveaway), "winner_id": None, "reward_text": None, "entry_count": 0}
+        winner_id = random.choice([row["user_id"] for row in entries])
+        reward_text = None
+        if giveaway["reward_type"] == "gems":
+            conn.execute(
+                "INSERT INTO xp_data (guild_id, user_id, xp) VALUES (?,?,?) "
+                "ON CONFLICT(guild_id, user_id) DO UPDATE SET xp=xp+excluded.xp",
+                (giveaway["guild_id"], winner_id, giveaway["reward_value"]),
+            )
+        else:
+            reward = conn.execute(
+                "SELECT id, reward_text FROM shop_item_rewards "
+                "WHERE shop_item_id=? AND guild_id=? AND used=0 ORDER BY id LIMIT 1",
+                (giveaway["reward_value"], giveaway["guild_id"]),
+            ).fetchone()
+            if not reward:
+                conn.rollback()
+                return None
+            updated = conn.execute(
+                "UPDATE shop_item_rewards SET used=1, used_by=?, used_at=? "
+                "WHERE id=? AND used=0",
+                (winner_id, datetime.now().isoformat(), reward["id"]),
+            ).rowcount
+            if updated != 1:
+                conn.rollback()
+                return None
+            reward_text = reward["reward_text"]
+        conn.execute(
+            "UPDATE giveaways SET status='ended', winner_id=?, reward_text=? WHERE id=?",
+            (winner_id, reward_text, giveaway_id),
+        )
+        conn.commit()
+        result = dict(giveaway)
+        result.update(winner_id=winner_id, reward_text=reward_text, entry_count=len(entries))
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 # ── Invite cache helpers ───────────────────────────────────────
 
@@ -2291,6 +2482,78 @@ async def notify_xp(bot: commands.Bot, guild_id: int, content: str = "", embed: 
     except Exception:
         pass
 
+async def announce_event_start(bot: commands.Bot, guild_id: int, event: dict):
+    """Announce an event in the configured event channel."""
+    config = db_get_config(guild_id)
+    channel_id = config.get("event_announce_channel_id")
+    if not channel_id:
+        return False
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return False
+    event = dict(event)
+    role_id = config.get("share_ping_role_id")
+    mention = f"<@&{role_id}>" if role_id else "@everyone"
+    if event.get("event_type") == "double_xp":
+        try:
+            event_config = json.loads(event.get("config_json") or "{}")
+            multiplier = event_config.get("multiplier", config.get("event_double_xp_mult", 2.0))
+        except Exception:
+            multiplier = config.get("event_double_xp_mult", 2.0)
+        description = (
+            f"🎉 **{event['name']}** has started!\n"
+            f"All {cur(config)} gains are **×{multiplier}** for **{event_duration_label(event)}**."
+        )
+    else:
+        description = (
+            f"🏁 **{event['name']}** is now active!\n"
+            f"Work together to reach the community goal during **{event_duration_label(event)}**."
+        )
+    try:
+        await channel.send(f"{mention}\n{description}")
+        return True
+    except Exception as ex:
+        print(f"[EventAnnounce] {ex}")
+        return False
+
+async def announce_community_goal_completion(bot: commands.Bot, goal: dict):
+    """Reward contributors and announce completion exactly once."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT enabled, completed FROM community_goals WHERE id=? AND guild_id=?",
+        (goal["id"], goal["guild_id"]),
+    ).fetchone()
+    if not row or not row["enabled"] or not row["completed"]:
+        conn.close()
+        return False
+    conn.execute("UPDATE community_goals SET enabled=0 WHERE id=?", (goal["id"],))
+    conn.commit()
+    conn.close()
+
+    contributors = json.loads(goal.get("contributors") or "[]") if isinstance(goal.get("contributors"), str) else goal.get("contributors", [])
+    for user_id in contributors:
+        db_add_xp(goal["guild_id"], user_id, goal["reward_xp"])
+    config = db_get_config(goal["guild_id"])
+    channel_id = config.get("event_announce_channel_id")
+    channel = bot.get_channel(channel_id) if channel_id else None
+    embed = E(
+        "🏁 Community Share Goal Completed!",
+        f"**{goal['name']}** reached **{goal['target']} shares**.\n"
+        f"{len(contributors)} contributor(s) each earned **{cur(config, goal['reward_xp'])}**!",
+        C_EVENT,
+    )
+    if channel:
+        try:
+            await channel.send(
+                content=" ".join(f"<@{user_id}>" for user_id in contributors),
+                embed=embed,
+            )
+        except Exception as ex:
+            print(f"[GoalAnnounce] {ex}")
+    else:
+        await notify_xp(bot, goal["guild_id"], embed=embed)
+    return True
+
 # ══════════════════════════════════════════════════════════════
 #  STREAK NICKNAME
 # ══════════════════════════════════════════════════════════════
@@ -2718,6 +2981,66 @@ class Modal3(discord.ui.Modal):
                 await self._cb(interaction, self.f1.value, self.f2.value, self.f3.value)
             except Exception as e:
                 print(f"[Modal3 error] {e}")
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ An error occurred. Please try again.", ephemeral=True)
+        else:
+            await interaction.response.defer()
+
+class Modal4(discord.ui.Modal):
+    def __init__(self, title: str,
+                 label1: str, ph1: str,
+                 label2: str, ph2: str,
+                 label3: str, ph3: str,
+                 label4: str, ph4: str,
+                 required4: bool = True, callback=None):
+        super().__init__(title=str(title)[:45])
+        self._cb = callback
+        self.f1 = discord.ui.TextInput(label=str(label1)[:45], placeholder=str(ph1)[:100], max_length=200)
+        self.f2 = discord.ui.TextInput(label=str(label2)[:45], placeholder=str(ph2)[:100], max_length=200)
+        self.f3 = discord.ui.TextInput(label=str(label3)[:45], placeholder=str(ph3)[:100], max_length=200)
+        self.f4 = discord.ui.TextInput(label=str(label4)[:45], placeholder=str(ph4)[:100],
+                                       required=required4, max_length=200)
+        for field in (self.f1, self.f2, self.f3, self.f4):
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self._cb:
+            try:
+                await self._cb(interaction, self.f1.value, self.f2.value, self.f3.value, self.f4.value)
+            except Exception as e:
+                print(f"[Modal4 error] {e}")
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ An error occurred. Please try again.", ephemeral=True)
+        else:
+            await interaction.response.defer()
+
+class Modal5(discord.ui.Modal):
+    def __init__(self, title: str,
+                 labels: tuple[str, str, str, str, str],
+                 placeholders: tuple[str, str, str, str, str],
+                 required: tuple[bool, bool, bool, bool, bool] = (True, True, True, True, True),
+                 callback=None):
+        super().__init__(title=str(title)[:45])
+        self._cb = callback
+        self.fields = []
+        for label, placeholder, is_required in zip(labels, placeholders, required):
+            field = discord.ui.TextInput(
+                label=str(label)[:45],
+                placeholder=str(placeholder)[:100],
+                required=is_required,
+                max_length=200,
+            )
+            self.fields.append(field)
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self._cb:
+            try:
+                await self._cb(interaction, *(field.value for field in self.fields))
+            except Exception as e:
+                print(f"[Modal5 error] {e}")
                 if not interaction.response.is_done():
                     await interaction.response.send_message(
                         "❌ An error occurred. Please try again.", ephemeral=True)
@@ -3960,6 +4283,8 @@ class ConfigChannelsMenu(_SubMenu):
         ping_r = _role(config.get("share_ping_role_id")) if config.get("share_ping_role_id") else "`@everyone`"
         e.add_field(name="🔔 Ping Role",          value=ping_r,                                           inline=True)
         e.add_field(name="📢 Event Announce",     value=_ch(config.get("event_announce_channel_id")),     inline=True)
+        e.add_field(name="🎉 Giveaway Channel",   value=_ch(config.get("giveaway_channel_id")),           inline=True)
+        e.add_field(name="🎉 Giveaway Role",      value=_role(config.get("giveaway_role_id")),            inline=True)
         cat_id = config.get("ticket_category_id")
         e.add_field(name="🎫 Ticket Category",    value=f"`{cat_id}`" if cat_id else "`No category`",     inline=True)
         e.add_field(name="🎯 Reaction Channel",   value=_ch(config.get("reaction_channel_id")),           inline=True)
@@ -3975,6 +4300,8 @@ class ConfigChannelsMenu(_SubMenu):
             "**Backup** — DB file every 15 min\n"
             "**Admin Commands** — staff-only channel where ALL bot commands work freely, bypassing every channel restriction\n"
             "**Event Announce** — event launch ping (pings Notification role)\n"
+            "**Giveaway Channel** — giveaway posts and entry buttons\n"
+            "**Giveaway Role** — role pinged for giveaway announcements\n"
             "**Ticket Category** — category where purchase tickets are created\n"
             "**Reaction Channel** — restrict Meeple Owner gem reactions to this channel"
         ), inline=False)
@@ -4065,6 +4392,34 @@ class ConfigChannelsMenu(_SubMenu):
     async def btn_event_announce(self, interaction, btn):
         await self._ch_btn("Event Announce Channel", "event_announce_channel_id",
                            "Set Event Announce Channel")(interaction, btn)
+
+    @discord.ui.button(label="🎉 Giveaway Channel",  style=discord.ButtonStyle.green, row=4)
+    async def btn_giveaway_channel(self, interaction, btn):
+        await self._ch_btn("Giveaway Channel", "giveaway_channel_id",
+                           "Set Giveaway Channel")(interaction, btn)
+
+    @discord.ui.button(label="🎉 Giveaway Role",     style=discord.ButtonStyle.green, row=4)
+    async def btn_giveaway_role(self, interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            if not value.strip():
+                db_set_config(self.guild.id, giveaway_role_id=None)
+                await inter.response.send_message("✅ Giveaway role removed.", ephemeral=True)
+            else:
+                role_id = parse_role_id(value)
+                if not role_id:
+                    await inter.response.send_message("❌ Invalid role mention or ID.", ephemeral=True)
+                    return
+                db_set_config(self.guild.id, giveaway_role_id=role_id)
+                await inter.response.send_message(
+                    f"✅ Giveaway role set to <@&{role_id}>.", ephemeral=True)
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            "Set Giveaway Role", "Role mention or ID (empty = remove)",
+            placeholder="@Giveaway or 1234567890",
+            default=str(config.get("giveaway_role_id") or ""),
+            required=False, callback=submit
+        ))
 
     @discord.ui.button(label="Reaction Channel",     style=discord.ButtonStyle.blurple, row=2)
     async def btn_reaction_ch(self, interaction, btn):
@@ -6372,9 +6727,11 @@ class LegacyConfigShopMenu(_SubMenu):
                 continue
             line = f"{c_emoji} **{item['price']:,} {c_name}**"
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
+            # Daily shop keeps the artwork as a compact right-side thumbnail.
+            # Discord preserves the source aspect ratio in this slot.
             if item.get("image_url"):
                 ie.set_thumbnail(url=item["image_url"])
-            if item.get("reward_stock_required") and item.get("show_stock", 0):
+            if item.get("reward_stock_required"):
                 available = db_count_available_rewards(item["id"], self.guild.id)
                 ie.set_footer(
                     text="🚫 Out of Stock"
@@ -6743,65 +7100,77 @@ class ConfigEventsMenu(_SubMenu):
         if not events:
             e.description = "No events created yet. Add a Double Bonus event or Community Goal."
         else:
-            now = datetime.now().isoformat()
+            now = datetime.now()
             for ev in events[:6]:
-                status = "🟢 Active" if (ev["enabled"] and ev["start_date"] <= now <= ev["end_date"]) else \
-                         "⏳ Upcoming" if (ev["enabled"] and now < ev["start_date"]) else \
+                start = event_start(ev)
+                end = event_end(ev)
+                status = "🟢 Active" if (ev["enabled"] and start <= now <= end) else \
+                         "⏳ Upcoming" if (ev["enabled"] and now < start) else \
                          "🔴 Ended/Disabled"
                 e.add_field(
                     name=f"{status} — {ev['name']} [{ev['event_type']}]",
-                    value=f"{ev['start_date'][:10]} → {ev['end_date'][:10]}  ID:`{ev['id']}`",
+                    value=f"Duration: **{event_duration_label(ev)}**  ID:`{ev['id']}`",
                     inline=False
                 )
         return e
 
     @discord.ui.button(label="➕ Add Double Bonus Event", style=discord.ButtonStyle.green, row=0)
     async def btn_add_dxp(self, interaction: discord.Interaction, btn):
-        async def submit(inter, v_name, v_start, v_end):
+        async def submit(inter, v_name, v_days):
             try:
-                start_dt = datetime.strptime(v_start.strip(), "%Y-%m-%d")
-                end_dt   = datetime.strptime(v_end.strip(), "%Y-%m-%d")
-                if end_dt < start_dt: raise ValueError
+                duration_days = int(v_days.strip())
+                if duration_days <= 0 or duration_days > 365:
+                    raise ValueError
             except ValueError:
-                await inter.response.send_message("❌ Use YYYY-MM-DD format. End must be after start.", ephemeral=True)
+                await inter.response.send_message("❌ Enter a duration in days from 1 to 365.", ephemeral=True)
                 return
+            start_dt = datetime.now()
+            end_dt = start_dt + timedelta(days=duration_days)
             config = db_get_config(self.guild.id)
             mult = config.get("event_double_xp_mult", 2.0)
             conn = get_db()
             conn.execute(
-                "INSERT INTO events (guild_id, name, description, event_type, start_date, end_date, config_json) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO events (guild_id, name, description, event_type, start_date, end_date, duration_days, config_json) VALUES (?,?,?,?,?,?,?,?)",
                 (self.guild.id, v_name.strip(), f"Double Bonus event (×{mult})", "double_xp",
-                 start_dt.isoformat(), end_dt.replace(hour=23, minute=59, second=59).isoformat(),
+                 start_dt.isoformat(), end_dt.isoformat(), duration_days,
                  json.dumps({"multiplier": mult}))
             )
             conn.commit()
             conn.close()
-            await inter.response.send_message(f"✅ Double Bonus event **{v_name.strip()}** created.", ephemeral=True)
+            await inter.response.send_message(
+                f"✅ Double Bonus event **{v_name.strip()}** created for **{duration_days} day(s)**.",
+                ephemeral=True
+            )
             await self._refresh(interaction)
-        await interaction.response.send_modal(Modal3(
+        await interaction.response.send_modal(Modal2(
             "Add Double Bonus Event",
             "Event name", "Double Bonus Weekend",
-            "Start date", "YYYY-MM-DD",
-            "End date", "YYYY-MM-DD",
+            "Duration in days", "7",
             callback=submit
         ))
 
     @discord.ui.button(label="➕ Add Community Goal", style=discord.ButtonStyle.green, row=0)
     async def btn_add_goal(self, interaction: discord.Interaction, btn):
-        async def submit(inter, v_name, v_target, v_xp):
+        async def submit(inter, v_name, v_target, v_xp, v_days):
             try:
                 target = int(v_target.strip())
                 xp = int(v_xp.strip())
-                if target <= 0 or xp < 0: raise ValueError
+                duration_days = int(v_days.strip())
+                if target <= 0 or xp < 0 or duration_days <= 0 or duration_days > 365:
+                    raise ValueError
             except ValueError:
-                await inter.response.send_message("❌ Target must be positive, reward non-negative.", ephemeral=True)
+                await inter.response.send_message(
+                    "❌ Target must be positive, reward non-negative, and duration 1–365 days.",
+                    ephemeral=True
+                )
                 return
+            start_dt = datetime.now()
+            end_dt = start_dt + timedelta(days=duration_days)
             conn = get_db()
             ev_row = conn.execute(
-                "INSERT INTO events (guild_id, name, description, event_type, start_date, end_date, config_json) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO events (guild_id, name, description, event_type, start_date, end_date, duration_days, config_json) VALUES (?,?,?,?,?,?,?,?)",
                 (self.guild.id, v_name.strip(), f"Community goal: {target} shares", "community_goal",
-                 datetime.now().isoformat(),
-                 (datetime.now() + timedelta(days=30)).isoformat(),
+                 start_dt.isoformat(), end_dt.isoformat(), duration_days,
                  json.dumps({"goal_type": "share_videos", "target": target, "reward_xp": xp}))
             )
             ev_id = ev_row.lastrowid
@@ -6816,13 +7185,103 @@ class ConfigEventsMenu(_SubMenu):
                 f"✅ Community goal **{v_name.strip()}** created.\nTarget: {target} shares → **{cur(cfg2, xp)}** per contributor.",
                 ephemeral=True
             )
+            created = db_get_all_events(self.guild.id)
+            created_event = next((event for event in created if event["id"] == ev_id), None)
+            if created_event:
+                await announce_event_start(inter.client, self.guild.id, created_event)
             await self._refresh(interaction)
-        await interaction.response.send_modal(Modal3(
+        await interaction.response.send_modal(Modal4(
             "Add Community Goal",
             "Goal name", "100 Supporter Challenge",
             "Target (e.g. number of shares)", "100",
             "Reward per contributor", "150",
+            "Duration in days", "30",
             callback=submit
+        ))
+
+    @discord.ui.button(label="🎉 Add Giveaway", style=discord.ButtonStyle.green, row=1)
+    async def btn_add_giveaway(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        if not config.get("giveaway_channel_id"):
+            await interaction.response.send_message(
+                "❌ Configure a Giveaway Channel in `/config → Channels` first.",
+                ephemeral=True,
+            )
+            return
+
+        async def submit(inter, v_title, v_description, v_days, v_reward_type, v_amount):
+            reward_type = v_reward_type.strip().lower()
+            if reward_type not in {"gems", "shop", "item"}:
+                await inter.response.send_message(
+                    "❌ Reward type must be `Gems` or `Shop`.", ephemeral=True)
+                return
+            try:
+                duration_days = int(v_days.strip())
+                if duration_days <= 0 or duration_days > 365:
+                    raise ValueError
+            except ValueError:
+                await inter.response.send_message(
+                    "❌ Enter a duration in days from 1 to 365.", ephemeral=True)
+                return
+            title = v_title.strip()
+            description = v_description.strip()
+            if not title:
+                await inter.response.send_message("❌ A giveaway title is required.", ephemeral=True)
+                return
+            end_at = (datetime.now() + timedelta(days=duration_days)).isoformat()
+            if reward_type == "gems":
+                try:
+                    amount = int(v_amount.strip())
+                    if amount <= 0:
+                        raise ValueError
+                except ValueError:
+                    await inter.response.send_message(
+                        "❌ Gems reward must be a positive whole number.", ephemeral=True)
+                    return
+                try:
+                    giveaway_id = await publish_giveaway(
+                        inter.client, self.guild.id, inter.user.id, title,
+                        description, "gems", amount, end_at,
+                    )
+                except ValueError as ex:
+                    await inter.response.send_message(f"❌ {ex}", ephemeral=True)
+                    return
+                await inter.response.send_message(
+                    f"✅ Gems giveaway created (ID `{giveaway_id}`).", ephemeral=True)
+                await self._refresh(interaction)
+                return
+
+            items = [
+                item for item in db_get_shop_items(self.guild.id)
+                if item.get("reward_stock_required")
+                and db_count_available_rewards(item["id"], self.guild.id) > 0
+            ]
+            if not items:
+                await inter.response.send_message(
+                    "❌ No key-backed shop items have available stock.", ephemeral=True)
+                return
+            await inter.response.send_message(
+                "Choose the key-backed shop item for this giveaway:",
+                view=GiveawayShopSelectView(
+                    inter.client, self.guild.id, inter.user.id,
+                    title, description, end_at,
+                ),
+                ephemeral=True,
+            )
+            await self._refresh(interaction)
+
+        await interaction.response.send_modal(Modal5(
+            "Add Giveaway",
+            (
+                "Title", "Description", "Duration in days",
+                "Reward type (Gems or Shop)", "Gems amount / leave blank for Shop",
+            ),
+            (
+                "Summer giveaway", "What members can win",
+                "7", "Gems", "500",
+            ),
+            required=(True, False, True, True, False),
+            callback=submit,
         ))
 
     @discord.ui.button(label="Toggle Event",  style=discord.ButtonStyle.grey, row=1)
@@ -6858,27 +7317,7 @@ class ConfigEventsMenu(_SubMenu):
             await inter2.response.send_message("✅ Event toggled.", ephemeral=True)
             # Announce in event announce channel when event is turned ON
             if newly_enabled and row:
-                config = db_get_config(self.guild.id)
-                announce_ch_id = config.get("event_announce_channel_id")
-                notif_role_id  = config.get("share_ping_role_id")
-                if announce_ch_id:
-                    ch = inter2.client.get_channel(announce_ch_id)
-                    if ch:
-                        role_mention = f"<@&{notif_role_id}>" if notif_role_id else "@everyone"
-                        ev_type = row["event_type"]
-                        if ev_type == "double_xp":
-                            try:
-                                cfg_json = json.loads(row["config_json"] or "{}")
-                                mult = cfg_json.get("multiplier", config.get("event_double_xp_mult", 2.0))
-                            except Exception:
-                                mult = 2.0
-                            desc = f"🎉 **{row['name']}** has started! All {cur(config)} gains are **×{mult}** for the duration!"
-                        else:
-                            desc = f"🏁 **{row['name']}** is now active! Work together to reach the community goal!"
-                        try:
-                            await ch.send(f"{role_mention}\n{desc}\n_{row['start_date'][:10]} → {row['end_date'][:10]}_")
-                        except Exception as ex:
-                            print(f"[EventAnnounce] {ex}")
+                await announce_event_start(inter2.client, self.guild.id, dict(row))
             await self._refresh(interaction)
         sel.callback = on_select
         view.add_item(sel)
@@ -7921,8 +8360,17 @@ class ConfigShopMenu(_SubMenu):
                 description=f"{currency_emoji} **{item['price']:,} {currency_name}**",
                 color=C_GOLD,
             )
+            # This is the compact daily-shop style post, so keep artwork on
+            # the right instead of using the large member-shop image.
             if item.get("image_url"):
                 embed.set_thumbnail(url=item["image_url"])
+            if item.get("reward_stock_required"):
+                available = db_count_available_rewards(item["id"], self.guild.id)
+                embed.set_footer(
+                    text="🚫 Out of Stock"
+                    if available == 0
+                    else f"🔑 {available} reward key(s) remaining"
+                )
             embeds.append(embed)
         try:
             for start in range(0, len(embeds), 10):
@@ -9114,6 +9562,210 @@ class PurchaseTicketView(discord.ui.View):
         except discord.HTTPException:
             pass
 
+def _giveaway_end_timestamp(giveaway: dict) -> int:
+    try:
+        return int(datetime.fromisoformat(giveaway["end_at"]).timestamp())
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+def build_giveaway_embed(giveaway: dict, config: dict, ended: bool = False) -> discord.Embed:
+    reward_type = giveaway.get("reward_type")
+    if reward_type == "gems":
+        reward = cur(config, giveaway.get("reward_value", 0))
+    else:
+        item = db_get_shop_item(giveaway.get("reward_value"), giveaway["guild_id"])
+        reward = item["name"] if item else "Shop item"
+    if ended:
+        winner_id = giveaway.get("winner_id")
+        if winner_id:
+            result = f"Winner: <@{winner_id}>"
+        else:
+            result = "No valid entries."
+        description = (
+            f"**Reward:** {reward}\n"
+            f"**Entries:** {giveaway.get('entry_count', 0)}\n\n"
+            f"🎊 Giveaway ended!\n{result}"
+        )
+        embed = E(f"🎉 {giveaway['title']}", description, C_INFO)
+        giveaway_id = giveaway.get("id")
+        footer = "Giveaway closed"
+        if giveaway_id:
+            footer += f" • Giveaway ID: {giveaway_id}"
+        embed.set_footer(text=footer)
+        return embed
+    description = (
+        f"{giveaway.get('description') or 'Enter for a chance to win!'}\n\n"
+        f"**Reward:** {reward}\n"
+        f"**Ends:** <t:{_giveaway_end_timestamp(giveaway)}:R>\n"
+        "Click **Enter** below to join."
+    )
+    embed = E(f"🎉 {giveaway['title']}", description, C_EVENT)
+    footer = f"Entries: {giveaway.get('entry_count', 0)}"
+    if giveaway.get("id"):
+        footer += f" • Giveaway ID: {giveaway['id']}"
+    embed.set_footer(text=footer)
+    return embed
+
+def build_giveaway_failed_embed(giveaway: dict, config: dict) -> discord.Embed:
+    reward_type = giveaway.get("reward_type")
+    if reward_type == "gems":
+        reward = cur(config, giveaway.get("reward_value", 0))
+    else:
+        item = db_get_shop_item(giveaway.get("reward_value"), giveaway["guild_id"])
+        reward = item["name"] if item else "Shop item"
+    embed = E(
+        f"🎉 {giveaway['title']}",
+        f"**Reward:** {reward}\n\n"
+        "⚠️ Giveaway closed because the configured shop reward is out of stock.",
+        C_ERROR,
+    )
+    embed.set_footer(text=f"Giveaway ID: {giveaway.get('id', '?')} • Closed")
+    return embed
+
+class GiveawayView(discord.ui.View):
+    """Persistent entry button for giveaway messages."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Enter",
+        emoji="🎟️",
+        style=discord.ButtonStyle.green,
+        custom_id="giveaway:enter",
+    )
+    async def enter(self, interaction: discord.Interaction, button):
+        giveaway_id = None
+        if interaction.message and interaction.message.embeds:
+            footer = interaction.message.embeds[0].footer.text or ""
+            match = re.search(r"Giveaway ID: (\d+)", footer)
+            if match:
+                giveaway_id = int(match.group(1))
+        if not giveaway_id:
+            await interaction.response.send_message(
+                "❌ This giveaway message is missing its ID.", ephemeral=True)
+            return
+        giveaway = db_get_giveaway(giveaway_id, interaction.guild_id)
+        if not giveaway or giveaway["channel_id"] != interaction.channel_id:
+            await interaction.response.send_message(
+                "❌ This giveaway is no longer available here.", ephemeral=True)
+            return
+        inserted, count = db_enter_giveaway(giveaway_id, interaction.user.id)
+        if inserted:
+            await interaction.response.send_message(
+                f"✅ You are entered! There are now **{count}** entr{'y' if count == 1 else 'ies'}.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "ℹ️ You are already entered, or this giveaway has ended.", ephemeral=True)
+        if inserted:
+            giveaway["entry_count"] = count
+            try:
+                await interaction.message.edit(
+                    embed=build_giveaway_embed(giveaway, db_get_config(interaction.guild_id)),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+class GiveawayShopSelectView(discord.ui.View):
+    def __init__(self, bot_ref, guild_id: int, host_id: int,
+                 title: str, description: str, end_at: str):
+        super().__init__(timeout=120)
+        self.bot_ref = bot_ref
+        self.guild_id = guild_id
+        self.host_id = host_id
+        self.title = title
+        self.description = description
+        self.end_at = end_at
+        items = [
+            item for item in db_get_shop_items(guild_id)
+            if item.get("reward_stock_required") and db_count_available_rewards(item["id"], guild_id) > 0
+        ][:25]
+        options = [
+            discord.SelectOption(
+                label=str(item["name"])[:100],
+                value=str(item["id"]),
+                description=f"{db_count_available_rewards(item['id'], guild_id)} key(s) available"[:100],
+            )
+            for item in items
+        ]
+        self.select = discord.ui.Select(
+            placeholder="Choose a key-backed shop item",
+            options=options or [discord.SelectOption(label="No items available", value="none")],
+            disabled=not bool(options),
+        )
+        self.select.callback = self._selected
+        self.add_item(self.select)
+
+    async def _selected(self, interaction: discord.Interaction):
+        if interaction.user.id != self.host_id:
+            await interaction.response.send_message("❌ Only the giveaway creator can choose the reward.", ephemeral=True)
+            return
+        if self.select.values[0] == "none":
+            await interaction.response.send_message("❌ No key-backed shop item is available.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        giveaway_id = await publish_giveaway(
+            self.bot_ref, self.guild_id, self.host_id, self.title,
+            self.description, "shop", int(self.select.values[0]), self.end_at,
+        )
+        await interaction.followup.send(
+            f"✅ Giveaway created in the configured giveaway channel (ID `{giveaway_id}`).",
+            ephemeral=True,
+        )
+        self.stop()
+
+class GiveawayCreationView(discord.ui.View):
+    def __init__(self, bot_ref, guild_id: int, host_id: int,
+                 title: str, description: str, end_at: str):
+        super().__init__(timeout=120)
+        self.bot_ref = bot_ref
+        self.guild_id = guild_id
+        self.host_id = host_id
+        self.title = title
+        self.description = description
+        self.end_at = end_at
+
+    @discord.ui.button(label="Choose a shop item", style=discord.ButtonStyle.green)
+    async def choose_shop_item(self, interaction: discord.Interaction, button):
+        if interaction.user.id != self.host_id:
+            await interaction.response.send_message(
+                "❌ Only the giveaway creator can choose the reward.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content="Choose the key-backed shop item for this giveaway:",
+            view=GiveawayShopSelectView(
+                self.bot_ref, self.guild_id, self.host_id,
+                self.title, self.description, self.end_at,
+            ),
+        )
+
+async def publish_giveaway(bot_ref, guild_id: int, host_id: int, title: str,
+                           description: str, reward_type: str, reward_value: int,
+                           end_at: str) -> int:
+    config = db_get_config(guild_id)
+    channel_id = config.get("giveaway_channel_id")
+    channel = bot_ref.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        raise ValueError("No giveaway channel is configured or it cannot be found.")
+    giveaway_id = db_create_giveaway(
+        guild_id, channel_id, host_id, title, description,
+        reward_type, reward_value, end_at,
+    )
+    giveaway = db_get_giveaway(giveaway_id, guild_id)
+    giveaway["entry_count"] = 0
+    embed = build_giveaway_embed(giveaway, config)
+    role_id = config.get("giveaway_role_id")
+    content = f"<@&{role_id}>" if role_id else None
+    try:
+        message = await channel.send(content=content, embed=embed, view=GiveawayView())
+    except Exception:
+        db_mark_giveaway_failed(giveaway_id)
+        raise
+    db_set_giveaway_message(giveaway_id, message.id)
+    return giveaway_id
+
 
 class PendingPurchaseView(discord.ui.View):
     """Approve or reject a pending shop purchase requiring Gems Owner sign-off.
@@ -9392,9 +10044,11 @@ class ShopView(discord.ui.View):
                 extras.append(f"📝 {item.get('text_label') or 'Info required'}")
             ie.description = price_str + ("  •  " + "  •  ".join(extras) if extras else "")
 
-            # image — only works when a persistent URL (imgur, etc.) is stored
+            # The member-facing shop uses the large embed image.  A thumbnail
+            # is intentionally not used here: Discord constrains thumbnails
+            # to a small box and artwork appears cropped in the normal shop.
             if item.get("image_url"):
-                ie.set_thumbnail(url=item["image_url"])
+                ie.set_image(url=item["image_url"])
 
             # Provided-by credit
             if item.get("provided_by"):
@@ -9414,7 +10068,7 @@ class ShopView(discord.ui.View):
                 already = db_count_user_purchases(item["name"], self.guild.id, self.user.id)
                 remaining_purchases = max(0, pur_limit - already)
                 ie.add_field(
-                    name="🔢 Purchase Limit",
+                    name="Purchase Limit",
                     value=f"**{remaining_purchases}/{pur_limit}** remaining for you",
                     inline=True
                 )
@@ -9753,26 +10407,68 @@ async def check_expired_items():
 
 @tasks.loop(hours=24)
 async def check_community_goals():
-    """Check if any community goals completed and distribute rewards."""
+    """Recover completed goals if the bot was offline at completion time."""
     await bot.wait_until_ready()
     conn = get_db()
     goals = conn.execute(
         "SELECT * FROM community_goals WHERE completed=1 AND enabled=1"
     ).fetchall()
-    # Mark as distributed (disable)
-    for g in goals:
-        contribs = json.loads(g["contributors"] or "[]")
-        for uid in contribs:
-            db_add_xp(g["guild_id"], uid, g["reward_xp"])
-        if contribs:
-            cfg = db_get_config(g["guild_id"])
-            e = E("🏁 Community Goal Completed!",
-                  f"**{g['name']}**\n{len(contribs)} contributors each earned **+{cur(cfg, g['reward_xp'])}**!",
-                  C_EVENT)
-            await notify_xp(bot, g["guild_id"], embed=e)
-        conn.execute("UPDATE community_goals SET enabled=0 WHERE id=?", (g["id"],))
-        conn.commit()
     conn.close()
+    for g in goals:
+        await announce_community_goal_completion(bot, dict(g))
+
+@tasks.loop(minutes=1)
+async def check_giveaways():
+    """Close expired giveaways and edit their original messages."""
+    await bot.wait_until_ready()
+    now = datetime.now()
+    for giveaway in db_get_active_giveaways():
+        try:
+            if datetime.fromisoformat(giveaway["end_at"]) > now:
+                continue
+        except (TypeError, ValueError):
+            db_mark_giveaway_failed(giveaway["id"])
+            continue
+        result = db_draw_giveaway(giveaway["id"])
+        if result is None:
+            db_mark_giveaway_failed(giveaway["id"])
+            continue
+        result["entry_count"] = result.get("entry_count", 0)
+        config = db_get_config(result["guild_id"])
+        channel = bot.get_channel(result["channel_id"])
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(result["channel_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+        message = None
+        if result.get("message_id"):
+            try:
+                message = await channel.fetch_message(result["message_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                message = None
+        if message:
+            try:
+                await message.edit(
+                    content=None,
+                    embed=build_giveaway_embed(result, config, ended=True),
+                    view=None,
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        winner_id = result.get("winner_id")
+        if winner_id:
+            reward_message = (
+                f"🎉 You won **{result['title']}**!\n"
+                f"Reward: **{build_giveaway_embed(result, config, ended=True).description.split('**Reward:** ', 1)[-1].splitlines()[0]}**"
+            )
+            if result.get("reward_text"):
+                reward_message += f"\nYour item key/reward: `{result['reward_text']}`"
+            try:
+                user = bot.get_user(winner_id) or await bot.fetch_user(winner_id)
+                await user.send(reward_message)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
 @tasks.loop(minutes=1)
 async def check_share_channel_lock():
@@ -10152,7 +10848,7 @@ async def send_daily_shop():
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
             if item.get("image_url"):
                 ie.set_thumbnail(url=item["image_url"])
-            if item.get("reward_stock_required") and item.get("show_stock", 0):
+            if item.get("reward_stock_required"):
                 available = db_count_available_rewards(item["id"], guild_id)
                 ie.set_footer(
                     text="🚫 Out of Stock" if available == 0 else f"🔑 {available} reward key(s) remaining"
@@ -10305,7 +11001,9 @@ async def on_ready():
             C_SUCCESS,
         )
     bot.add_view(PurchaseTicketView())
+    bot.add_view(GiveawayView())
     for loop in [check_youtube, auto_backup, check_expired_items, check_community_goals,
+                 check_giveaways,
                  check_streak_reminders, check_share_channel_lock, check_purchase_ticket_reminders,
                  renew_websub_subscriptions,
                  check_daily_quests, check_new_shop_item_dms,
@@ -11080,9 +11778,8 @@ async def _handle_share(message: discord.Message, config: dict):
     for goal in active_goals:
         if goal["goal_type"] == "share_videos" and not goal["completed"]:
             updated = db_add_goal_contribution(guild_id, goal["id"], message.author.id)
-            if updated.get("completed") and not goal["completed"]:
-                # Already handled by check_community_goals background task
-                pass
+            if updated.get("newly_completed"):
+                await announce_community_goal_completion(bot, updated)
     # Achievements
     await check_achievements(bot, guild_id, message.author.id)
 
