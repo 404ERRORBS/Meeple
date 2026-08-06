@@ -308,7 +308,13 @@ def init_db():
         duration_days INTEGER,
         show_duration INTEGER DEFAULT 1,
         requires_text INTEGER DEFAULT 0,
-        text_label    TEXT
+        text_label    TEXT,
+        notify_admin INTEGER DEFAULT 0,
+        stock        INTEGER DEFAULT NULL,
+        sort_order   INTEGER DEFAULT 0,
+        duration_hours INTEGER DEFAULT 0,
+        reward_stock_required INTEGER DEFAULT 0,
+        out_of_stock_notified INTEGER DEFAULT 0
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS shop_item_rewards (
@@ -319,6 +325,17 @@ def init_db():
         used         INTEGER DEFAULT 0,
         used_by      INTEGER,
         used_at      TEXT
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS purchase_tickets (
+        channel_id          INTEGER PRIMARY KEY,
+        guild_id            INTEGER NOT NULL,
+        buyer_id            INTEGER NOT NULL,
+        item_name           TEXT NOT NULL,
+        created_at          TEXT DEFAULT (datetime('now')),
+        reminder_message_id INTEGER,
+        last_reminder_at    TEXT,
+        closed              INTEGER DEFAULT 0
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS inventory (
@@ -571,6 +588,22 @@ def init_db():
         "ALTER TABLE shop_items ADD COLUMN item_expires_at TEXT DEFAULT NULL",
         # Stock visibility in /shop (0 = hidden from members, 1 = shown)
         "ALTER TABLE shop_items ADD COLUMN show_stock INTEGER DEFAULT 0",
+        # A key-backed item is unavailable once all reward keys are consumed.
+        "ALTER TABLE shop_items ADD COLUMN duration_hours INTEGER DEFAULT 0",
+        "ALTER TABLE shop_items ADD COLUMN reward_stock_required INTEGER DEFAULT 0",
+        "ALTER TABLE shop_items ADD COLUMN out_of_stock_notified INTEGER DEFAULT 0",
+        "ALTER TABLE guild_config ADD COLUMN ticket_reminder_enabled INTEGER DEFAULT 1",
+        "ALTER TABLE guild_config ADD COLUMN ticket_reminder_interval_hours INTEGER DEFAULT 1",
+        # Ticket follow-up controls.
+        "ALTER TABLE guild_config ADD COLUMN ticket_pings_enabled INTEGER DEFAULT 1",
+        "ALTER TABLE guild_config ADD COLUMN ticket_ping_interval_hours INTEGER DEFAULT 1",
+        # Configurable DM embed templates. Supported variables are expanded
+        # by render_dm_template() immediately before sending.
+        "ALTER TABLE guild_config ADD COLUMN dm_template_welcome TEXT",
+        "ALTER TABLE guild_config ADD COLUMN dm_template_daily_quest TEXT",
+        "ALTER TABLE guild_config ADD COLUMN dm_template_purchase TEXT",
+        "ALTER TABLE guild_config ADD COLUMN dm_template_new_item TEXT",
+        "ALTER TABLE guild_config ADD COLUMN dm_template_balance_change TEXT",
     ]:
         try:
             conn.execute(migration)
@@ -585,6 +618,14 @@ def init_db():
     conn.execute(
         "UPDATE shop_items SET created_at=datetime('now'), new_item_dm_sent=1 "
         "WHERE created_at IS NULL"
+    )
+    # Only listings that already have reward keys are key-backed. A listing
+    # becomes key-backed when its first key is added; the legacy numeric stock
+    # field never controls purchase availability.
+    conn.execute(
+        "UPDATE shop_items SET reward_stock_required=CASE WHEN EXISTS ("
+        "SELECT 1 FROM shop_item_rewards r WHERE r.shop_item_id=shop_items.id "
+        "AND r.guild_id=shop_items.guild_id) THEN 1 ELSE 0 END"
     )
     conn.commit()
 
@@ -714,6 +755,73 @@ def cur(config: dict, amount: int = None) -> str:
         return f"{emoji} {amount} {name}"
     return f"{emoji} {name}"
 
+
+def render_dm_template(template: Optional[str], variables: dict, default: str) -> str:
+    """Expand safe, user-configured DM template variables."""
+    text = template or default
+    values = {str(k): str(v) for k, v in variables.items()}
+    return re.sub(r"\{([a-zA-Z0-9_]+)\}", lambda m: values.get(m.group(1), m.group(0)), text)
+
+
+def format_reward_for_discord(reward_text: str) -> str:
+    """Make URLs clickable while keeping non-URL rewards safe and readable."""
+    value = str(reward_text).strip()
+    if re.fullmatch(r"https?://\S+", value):
+        return f"[Open reward]({value})"
+    return f"```\n{value[:1900]}\n```"
+
+
+def parse_duration_days_hours(value: str) -> tuple[int, int] | None:
+    """Parse the shared `days hours` duration format used by shop controls."""
+    parts = value.strip().replace(",", " ").split()
+    if len(parts) != 2:
+        return None
+    try:
+        days, hours = (int(part) for part in parts)
+    except ValueError:
+        return None
+    if days < 0 or hours < 0 or hours > 23 or (days == 0 and hours == 0):
+        return (0, 0) if days == 0 and hours == 0 else None
+    return days, hours
+
+
+def format_duration(days: int = 0, hours: int = 0) -> str:
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    return " ".join(parts) or "Permanent"
+
+
+def listing_expiry_label(item: dict) -> str:
+    """Describe a listing expiry without exposing a calendar-date control."""
+    expires_at = item.get("item_expires_at")
+    if not expires_at:
+        return "Permanent"
+    try:
+        remaining = datetime.fromisoformat(expires_at) - datetime.utcnow()
+        seconds = max(0, int(remaining.total_seconds()))
+        days, rem = divmod(seconds, 86400)
+        hours = rem // 3600
+        return format_duration(days, hours) if seconds else "Expired"
+    except (TypeError, ValueError):
+        return "Configured"
+
+
+def listing_expiry_from_duration(value: str) -> str | None | bool:
+    """Convert a `days hours` listing duration into an absolute storage value.
+
+    Returns None for permanent, False for invalid input.
+    """
+    parsed = parse_duration_days_hours(value)
+    if parsed is None:
+        return False
+    days, hours = parsed
+    if days == 0 and hours == 0:
+        return None
+    return (datetime.utcnow() + timedelta(days=days, hours=hours)).isoformat()
+
 # ── XP helpers ─────────────────────────────────────────────────
 
 def db_get_xp(guild_id: int, user_id: int) -> int:
@@ -842,17 +950,18 @@ def db_get_shop_items(guild_id: int) -> list:
 def db_add_shop_item(guild_id: int, name: str, price: int, image_url: str = None,
                      is_temporary: int = 0, duration_days: int = None,
                      show_duration: int = 1, requires_text: int = 0, text_label: str = None,
-                     notify_admin: int = 0, stock: int = None) -> int:
+                     notify_admin: int = 0, stock: int = None,
+                     duration_hours: int = 0) -> int:
     conn = get_db()
     created_at = datetime.utcnow().isoformat()
     c = conn.execute(
         """INSERT INTO shop_items
            (guild_id, name, price, image_url, created_at, new_item_dm_sent,
             is_temporary, duration_days, show_duration, requires_text, text_label,
-            notify_admin, stock)
-           VALUES (?,?,?,?,?,0,?,?,?,?,?,?,?)""",
+           notify_admin, stock, duration_hours, reward_stock_required)
+           VALUES (?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)""",
         (guild_id, name, price, image_url, created_at, is_temporary, duration_days,
-         show_duration, requires_text, text_label, notify_admin, stock)
+         show_duration, requires_text, text_label, notify_admin, stock, duration_hours, 0)
     )
     item_id = c.lastrowid
     conn.commit()
@@ -861,14 +970,89 @@ def db_add_shop_item(guild_id: int, name: str, price: int, image_url: str = None
 
 
 def db_decrement_stock(item_id: int, guild_id: int):
-    """Decrement stock by 1 for a shop item (if stock is limited)."""
+    """Legacy no-op: reward keys, not numeric stock, control availability."""
+    return
+
+def db_item_is_available(item_id: int, guild_id: int) -> bool:
+    """Return whether a key-backed listing still has a reward key."""
+    item = db_get_shop_item(item_id, guild_id)
+    if not item:
+        return False
+    if not item.get("reward_stock_required"):
+        return True
+    return db_count_available_rewards(item_id, guild_id) > 0
+
+
+def db_item_available_reward_count(item: dict, guild_id: int) -> Optional[int]:
+    """Return key stock for key-backed items, otherwise None for unlimited/manual delivery."""
+    if not item.get("reward_stock_required"):
+        return None
+    return db_count_available_rewards(item["id"], guild_id)
+
+
+def db_purchase_reserve_reward_and_charge(
+    item_id: int, guild_id: int, user_id: int, price: int
+) -> tuple[Optional[str], int, str]:
+    """Atomically reserve one reward key and charge the buyer.
+
+    The reward is reserved first inside the same SQLite transaction.  If the
+    buyer cannot pay, or no key remains, the transaction is rolled back and no
+    partial purchase is created.
+    """
     conn = get_db()
-    conn.execute(
-        "UPDATE shop_items SET stock = MAX(0, stock - 1) WHERE id=? AND guild_id=? AND stock IS NOT NULL",
-        (item_id, guild_id)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        balance_row = conn.execute(
+            "SELECT xp FROM xp_data WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+        balance = int(balance_row["xp"]) if balance_row else 0
+        if balance < price:
+            conn.rollback()
+            return None, balance, "insufficient_funds"
+
+        item_row = conn.execute(
+            "SELECT reward_stock_required FROM shop_items WHERE id=? AND guild_id=?",
+            (item_id, guild_id),
+        ).fetchone()
+        if not item_row:
+            conn.rollback()
+            return None, balance, "not_found"
+
+        reward = None
+        if item_row["reward_stock_required"]:
+            reward = conn.execute(
+                "SELECT id, reward_text FROM shop_item_rewards "
+                "WHERE shop_item_id=? AND guild_id=? AND used=0 ORDER BY id LIMIT 1",
+                (item_id, guild_id),
+            ).fetchone()
+            if not reward:
+                conn.rollback()
+                return None, balance, "out_of_stock"
+
+            changed = conn.execute(
+                "UPDATE shop_item_rewards SET used=1, used_by=?, used_at=? "
+                "WHERE id=? AND shop_item_id=? AND guild_id=? AND used=0",
+                (user_id, datetime.utcnow().isoformat(), reward["id"], item_id, guild_id),
+            ).rowcount
+            if changed != 1:
+                conn.rollback()
+                return None, balance, "out_of_stock"
+
+        charged = conn.execute(
+            "UPDATE xp_data SET xp=xp-? WHERE guild_id=? AND user_id=? AND xp>=?",
+            (price, guild_id, user_id, price),
+        ).rowcount
+        if charged != 1:
+            conn.rollback()
+            return None, balance, "insufficient_funds"
+        conn.commit()
+        return (reward["reward_text"] if reward else None), balance - price, "ok"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def db_set_shop_item_name(item_id: int, guild_id: int, new_name: str):
@@ -928,6 +1112,10 @@ def db_add_item_reward(shop_item_id: int, guild_id: int, reward_text: str):
         "INSERT INTO shop_item_rewards (shop_item_id, guild_id, reward_text) VALUES (?,?,?)",
         (shop_item_id, guild_id, reward_text)
     )
+    conn.execute(
+        "UPDATE shop_items SET reward_stock_required=1 WHERE id=? AND guild_id=?",
+        (shop_item_id, guild_id)
+    )
     conn.commit()
     conn.close()
 
@@ -950,23 +1138,88 @@ def db_count_available_rewards(shop_item_id: int, guild_id: int) -> int:
     return count
 
 def db_claim_next_reward(shop_item_id: int, guild_id: int, user_id: int) -> Optional[str]:
-    """Mark the next available reward as used and return its text. Returns None if none left."""
+    """Atomically reserve the next unused reward key.
+
+    BEGIN IMMEDIATE serializes concurrent buyers.  The conditional UPDATE is
+    also retained as a second guard so two processes can never deliver the
+    same key.
+    """
     conn = get_db()
-    row = conn.execute(
-        "SELECT id, reward_text FROM shop_item_rewards "
-        "WHERE shop_item_id=? AND guild_id=? AND used=0 ORDER BY id LIMIT 1",
-        (shop_item_id, guild_id)
-    ).fetchone()
-    if not row:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id, reward_text FROM shop_item_rewards "
+            "WHERE shop_item_id=? AND guild_id=? AND used=0 ORDER BY id LIMIT 1",
+            (shop_item_id, guild_id)
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        updated = conn.execute(
+            "UPDATE shop_item_rewards SET used=1, used_by=?, used_at=? "
+            "WHERE id=? AND shop_item_id=? AND guild_id=? AND used=0",
+            (user_id, datetime.now().isoformat(), row["id"], shop_item_id, guild_id)
+        ).rowcount
+        if updated != 1:
+            conn.rollback()
+            return None
+        conn.commit()
+        return row["reward_text"]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        return None
+
+def db_register_purchase_ticket(channel_id: int, guild_id: int, buyer_id: int, item_name: str):
+    conn = get_db()
     conn.execute(
-        "UPDATE shop_item_rewards SET used=1, used_by=?, used_at=? WHERE id=?",
-        (user_id, datetime.now().isoformat(), row["id"])
+        "INSERT OR REPLACE INTO purchase_tickets "
+        "(channel_id, guild_id, buyer_id, item_name, created_at, reminder_message_id, last_reminder_at, closed) "
+        "VALUES (?,?,?,?,?,?,?,0)",
+        (channel_id, guild_id, buyer_id, item_name, datetime.utcnow().isoformat(), None, None),
     )
     conn.commit()
     conn.close()
-    return row["reward_text"]
+
+def db_close_purchase_ticket(channel_id: int):
+    conn = get_db()
+    conn.execute(
+        "UPDATE purchase_tickets SET closed=1 WHERE channel_id=?",
+        (channel_id,),
+    )
+    conn.commit()
+    conn.close()
+
+def db_get_open_purchase_tickets() -> list:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM purchase_tickets WHERE closed=0"
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def db_update_ticket_reminder(channel_id: int, message_id: int, sent_at: str):
+    conn = get_db()
+    conn.execute(
+        "UPDATE purchase_tickets SET reminder_message_id=?, last_reminder_at=? "
+        "WHERE channel_id=? AND closed=0",
+        (message_id, sent_at, channel_id),
+    )
+    conn.commit()
+    conn.close()
+
+def db_mark_item_out_of_stock_notified(item_id: int, guild_id: int) -> bool:
+    """Mark a listing as notified exactly once when its last key is consumed."""
+    conn = get_db()
+    changed = conn.execute(
+        "UPDATE shop_items SET out_of_stock_notified=1 "
+        "WHERE id=? AND guild_id=? AND COALESCE(out_of_stock_notified, 0)=0",
+        (item_id, guild_id),
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return changed == 1
 
 def db_get_inventory(guild_id: int, user_id: int) -> list:
     conn = get_db()
@@ -2009,6 +2262,22 @@ async def notify_admin(bot: commands.Bot, guild_id: int, content: str = "", embe
     except Exception:
         pass
 
+
+async def notify_item_out_of_stock_once(bot: commands.Bot, guild_id: int, item: dict):
+    """Notify staff once when the last reward key for an item is consumed."""
+    if not db_mark_item_out_of_stock_notified(item["id"], guild_id):
+        return
+    config = db_get_config(guild_id)
+    role_id = config.get("manager_role_id")
+    content = f"<@&{role_id}>" if role_id else ""
+    embed = E(
+        "🚫 Shop Item Out of Stock",
+        f"**Item:** {item['name']}\n"
+        "All reward keys have been consumed. The item is now disabled in `/shop`.",
+        C_ERROR,
+    )
+    await notify_admin(bot, guild_id, content=content, embed=embed)
+
 async def notify_xp(bot: commands.Bot, guild_id: int, content: str = "", embed: discord.Embed = None):
     config = db_get_config(guild_id)
     ch_id = config.get("notification_channel_id")
@@ -2482,25 +2751,30 @@ class Modal4Shop(discord.ui.Modal):
 
 
 class Modal5(discord.ui.Modal):
-    """5-field modal for shop item creation (name, price, stock, duration, text label).
-    Image URL is set separately via the 'Set Image URL' button after creation.
-    """
+    """Shop item creation: name, price, image, expiry, and optional text input."""
     def __init__(self, title: str, currency_label: str = "Gems", callback=None):
         super().__init__(title=str(title)[:45])
         self._cb = callback
         self.f_name  = discord.ui.TextInput(label="Item name (emoji welcome)", placeholder="🎮 Custom Role", max_length=80)
         self.f_price = discord.ui.TextInput(label=f"Price in {str(currency_label)[:30]}", placeholder="500")
-        self.f_stock = discord.ui.TextInput(label="Stock quantity (0 = unlimited)", placeholder="0", required=False)
-        self.f_temp  = discord.ui.TextInput(label="Duration in days (0 = permanent)", placeholder="0 or 30")
+        self.f_image = discord.ui.TextInput(
+            label="Image URL (empty = no image)",
+            placeholder="https://cdn.discordapp.com/...",
+            required=False,
+        )
+        self.f_temp  = discord.ui.TextInput(
+            label="Expiry duration: days hours (0 0 = permanent)",
+            placeholder="0 0 or 30 12",
+        )
         self.f_text  = discord.ui.TextInput(label="Text field label (empty = none)", placeholder="Your game username", required=False)
-        for f in [self.f_name, self.f_price, self.f_stock, self.f_temp, self.f_text]:
+        for f in [self.f_name, self.f_price, self.f_image, self.f_temp, self.f_text]:
             self.add_item(f)
 
     async def on_submit(self, interaction: discord.Interaction):
         if self._cb:
             try:
                 await self._cb(interaction, self.f_name.value, self.f_price.value,
-                               self.f_stock.value, self.f_temp.value, self.f_text.value)
+                               self.f_image.value, self.f_temp.value, self.f_text.value)
             except Exception as e:
                 print(f"[Modal5 error] {e}")
                 if not interaction.response.is_done():
@@ -2818,13 +3092,21 @@ async def send_welcome_dm(member: discord.Member, config: dict, trigger: str = "
         title=f"👋 Welcome to **{member.guild.name}**!",
         color=C_MAIN
     )
-    e.description = (
-        f"Welcome, **{member.display_name}**! 🎉\n\n"
-        "This server rewards members for supporting the community.\n"
-        "Share the current video, complete quests, earn Gems, and spend them in `/shop`.\n\n"
-        "📖 Start with `/tutorial` to learn how to earn and use Gems.\n"
-        "If you need help, ping a member with the **Gems Owner** role.\n\n"
-        "Have fun and good luck! 🚀"
+    e.description = render_dm_template(
+        config.get("dm_template_welcome"),
+        {
+            "member": member.display_name,
+            "server": member.guild.name,
+            "tutorial": "/tutorial",
+            "gems": db_get_xp(member.guild.id, member.id),
+        },
+        (
+            f"Welcome, **{member.display_name}**! 🎉\n\n"
+            "Share the current video, complete quests, earn Gems, and spend them in `/shop`.\n\n"
+            "📖 Start with `/tutorial` to learn how to earn and use Gems.\n"
+            "If you need help, ping a member with the **Gems Owner** role.\n\n"
+            "Have fun and good luck! 🚀"
+        ),
     )
     e.set_footer(text=f"{member.guild.name} • Rewards System")
     dm_sent = False
@@ -2883,13 +3165,26 @@ async def notify_balance_change_dm(bot: commands.Bot, guild_id: int, actor,
     c_name = config.get("currency_name") or "Gems"
     change_line = f"**Change:** `{amount:+d}` {c_name}\n" if amount is not None else ""
     embed = discord.Embed(title="💰 Manual Balance Change", color=C_GOLD)
-    embed.description = (
+    embed.description = render_dm_template(
+        config.get("dm_template_balance_change"),
+        {
+            "server": bot.get_guild(guild_id).name if bot.get_guild(guild_id) else guild_id,
+            "action": action,
+            "actor": getattr(actor, "mention", str(actor)),
+            "member": f"<@{target_uid}>",
+            "before": cur(config, before),
+            "after": cur(config, after),
+            "change": f"{amount:+d}" if amount is not None else "0",
+            "gems": after,
+        },
+        (
         f"**Server:** {bot.get_guild(guild_id).name if bot.get_guild(guild_id) else guild_id}\n"
         f"**Action:** {action}\n"
         f"**Changed by:** {getattr(actor, 'mention', str(actor))}\n"
         f"**Member:** <@{target_uid}>\n"
         f"{change_line}"
         f"**Balance:** {cur(config, before)} → **{cur(config, after)}**"
+        ),
     )
     embed.set_footer(text="Sent because this recipient is configured in /config → DMs & Welcome")
     try:
@@ -3911,6 +4206,13 @@ class ConfigDMsMenu(_SubMenu):
         e.add_field(name="🔕 Notif Prompt Cooldown",    value=f"**{notif_label}**", inline=True)
         bulk_dm_role = config.get("bulk_dm_role_id")
         e.add_field(name="📨 Bulk DM Role",              value=_role(bulk_dm_role) if bulk_dm_role else "`Not set`", inline=True)
+        reminder_enabled = config.get("ticket_reminder_enabled", 1)
+        reminder_hours = max(1, _safe_int(config.get("ticket_reminder_interval_hours"), 1))
+        e.add_field(
+            name="🔔 Ticket Reminders",
+            value=f"{_on(reminder_enabled)} · every **{reminder_hours}h**",
+            inline=True,
+        )
         e.description = (
             "**Welcome DM** — bot DMs new members when they join\n"
             "**DM Role Filter** — (unused on join, only for reference)\n"
@@ -3924,6 +4226,7 @@ class ConfigDMsMenu(_SubMenu):
             "**New Item Delay** — wait before notifying, default **5 minutes** so images and rewards can be added\n"
             "**Purchase DM** — enable/disable DM notifications when a purchase ticket opens\n"
             "**Purchase DM Role** — role that receives purchase DMs (default: Meeple Owner)\n"
+            "**Ticket Reminders** — edit one reminder message per open ticket instead of posting duplicates\n"
             "**Notif Prompt Cooldown** — days before the 🔔 notification prompt reappears after 'Later'\n"
             "**Bulk DM Role** — role whose members receive the welcome DM when you press **📨 Send DMs** below\n"
             "➡️ Gift Gems settings moved to **🎁 Gift Gems** in the main /config menu."
@@ -4247,6 +4550,82 @@ class ConfigDMsMenu(_SubMenu):
             default=str(config.get("purchase_dm_role_id") or ""),
             required=False, callback=submit
         ))
+
+    @discord.ui.button(label="🔔 Ticket Reminders", style=discord.ButtonStyle.grey, row=3)
+    async def btn_ticket_reminders(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        new_val = 0 if config.get("ticket_reminder_enabled", 1) else 1
+        db_set_config(self.guild.id, ticket_reminder_enabled=new_val)
+        await interaction.response.send_message(
+            f"✅ Ticket reminders {'enabled' if new_val else 'disabled'}.",
+            ephemeral=True,
+        )
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="⏱️ Reminder Interval", style=discord.ButtonStyle.grey, row=3)
+    async def btn_ticket_reminder_interval(self, interaction: discord.Interaction, btn):
+        config = db_get_config(self.guild.id)
+        async def submit(inter, value):
+            try:
+                hours = int(value.strip())
+                if hours < 1 or hours > 168:
+                    raise ValueError
+            except ValueError:
+                await inter.response.send_message(
+                    "❌ Enter a whole number from 1 to 168 hours.",
+                    ephemeral=True,
+                )
+                return
+            db_set_config(self.guild.id, ticket_reminder_interval_hours=hours)
+            await inter.response.send_message(
+                f"✅ Ticket reminders will repeat every **{hours} hour(s)**.",
+                ephemeral=True,
+            )
+            await self._refresh(interaction)
+        await interaction.response.send_modal(Modal1(
+            title="Ticket Reminder Interval",
+            label="Interval in hours (1-168)",
+            placeholder="1",
+            default=str(config.get("ticket_reminder_interval_hours") or 1),
+            callback=submit,
+        ))
+
+    @discord.ui.button(label="✏️ DM Templates", style=discord.ButtonStyle.blurple, row=4)
+    async def btn_dm_templates(self, interaction: discord.Interaction, btn):
+        options = [
+            discord.SelectOption(label="Welcome DM", value="welcome"),
+            discord.SelectOption(label="Daily Quest DM", value="daily_quest"),
+            discord.SelectOption(label="Purchase DM", value="purchase"),
+            discord.SelectOption(label="New Shop Item DM", value="new_item"),
+            discord.SelectOption(label="Balance Change DM", value="balance_change"),
+        ]
+        view = discord.ui.View(timeout=120)
+        select = discord.ui.Select(placeholder="Choose a DM template to edit", options=options)
+        view.add_item(select)
+        parent = interaction
+        async def on_select(inter2):
+            key = select.values[0]
+            config2 = db_get_config(self.guild.id)
+            column = f"dm_template_{key}"
+            async def submit(inter3, value):
+                db_set_config(self.guild.id, **{column: value.strip() or None})
+                await inter3.response.send_message(
+                    f"✅ {key.replace('_', ' ').title()} DM template {'saved' if value.strip() else 'reset to default'}.",
+                    ephemeral=True,
+                )
+                await self._refresh(parent)
+            await inter2.response.send_modal(Modal1(
+                title=f"Edit {key.replace('_', ' ').title()} DM",
+                label="Message template",
+                placeholder="Use {member}, {server}, {gems}, {item}, {price}, {ticket}, {tutorial}",
+                default=config2.get(column) or "",
+                required=False,
+                max_length=4000,
+                paragraph=True,
+                callback=submit,
+            ))
+        select.callback = on_select
+        await interaction.response.send_message("✏️ Choose a DM template:", view=view, ephemeral=True)
 
     @discord.ui.button(label="📨 Send DMs",              style=discord.ButtonStyle.green,   row=3)
     async def btn_send_dms(self, i: discord.Interaction, b):
@@ -5220,7 +5599,7 @@ class LegacyConfigShopMenu(_SubMenu):
         guild_ref = self.guild
         config = db_get_config(guild_ref.id)
         c_name = config.get("currency_name") or "Gems"
-        async def submit(inter, v_name, v_price, v_stock, v_temp, v_text):
+        async def submit(inter, v_name, v_price, v_image, v_temp, v_text):
             try:
                 price = int(v_price)
                 if price <= 0: raise ValueError
@@ -5228,33 +5607,30 @@ class LegacyConfigShopMenu(_SubMenu):
                 await inter.response.send_message("❌ Price must be a positive number.", ephemeral=True)
                 return
             try:
-                days = int(v_temp)
-                if days < 0: raise ValueError
+                parts = v_temp.strip().split()
+                if len(parts) not in (1, 2):
+                    raise ValueError
+                days = int(parts[0])
+                hours = int(parts[1]) if len(parts) == 2 else 0
+                if days < 0 or hours < 0 or hours > 23:
+                    raise ValueError
             except ValueError:
-                await inter.response.send_message("❌ Duration must be 0 (permanent) or a positive number of days.", ephemeral=True)
+                await inter.response.send_message("❌ Expiry must be `days hours`; hours must be 0-23. Use `0 0` for permanent.", ephemeral=True)
                 return
-            try:
-                stock_val = int(v_stock.strip()) if v_stock.strip() else 0
-                if stock_val < 0: raise ValueError
-            except ValueError:
-                await inter.response.send_message("❌ Stock must be 0 (unlimited) or a positive number.", ephemeral=True)
-                return
-            is_temp       = 1 if days > 0 else 0
+            is_temp       = 1 if days > 0 or hours > 0 else 0
             dur_days      = days if days > 0 else None
             requires_text = 1 if v_text.strip() else 0
             text_label    = v_text.strip() or None
-            stock_db      = stock_val if stock_val > 0 else None  # None = unlimited
-            item_id = db_add_shop_item(guild_ref.id, v_name.strip(), price, None,
+            item_id = db_add_shop_item(guild_ref.id, v_name.strip(), price, v_image.strip() or None,
                                        is_temp, dur_days, 1, requires_text, text_label,
-                                       stock=stock_db)
+                                       stock=None, duration_hours=hours)
             tags = []
-            if is_temp:        tags.append(f"⏳ {days} days")
+            if is_temp:        tags.append(f"⏳ {days}d {hours}h")
             if requires_text:  tags.append(f"📝 requires text")
-            if stock_db:       tags.append(f"📦 {stock_val} in stock")
             await inter.response.send_message(
                 f"✅ Added **{v_name.strip()}** — **{cur(config, price)}** (ID: `{item_id}`)\n"
-                f"💡 Set an image via **🖼️ Set Image URL**."
-                + ("\n" + "  ".join(tags) if tags else "\nPermanent · Unlimited stock"),
+                f"🔑 Add reward keys in **🔑 Rewards & Stock**."
+                + ("\n" + "  ".join(tags) if tags else "\nPermanent · Add reward keys to enable stock"),
                 ephemeral=True
             )
             await self._refresh(interaction)
@@ -5997,12 +6373,14 @@ class LegacyConfigShopMenu(_SubMenu):
             line = f"{c_emoji} **{item['price']:,} {c_name}**"
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
             if item.get("image_url"):
-                ie.set_image(url=item["image_url"])
-            if item.get("stock") is not None:
-                if item["stock"] == 0:
-                    ie.set_footer(text="🚫 Sold out")
-                else:
-                    ie.set_footer(text=f"📦 {item['stock']} remaining")
+                ie.set_thumbnail(url=item["image_url"])
+            if item.get("reward_stock_required") and item.get("show_stock", 0):
+                available = db_count_available_rewards(item["id"], self.guild.id)
+                ie.set_footer(
+                    text="🚫 Out of Stock"
+                    if available == 0
+                    else f"🔑 {available} reward key(s) remaining"
+                )
             embeds.append(ie)
             live_count += 1
         try:
@@ -6922,40 +7300,34 @@ class ShopEditMenu(_SubMenu):
     @discord.ui.button(label="📅 Listing Expiry", style=discord.ButtonStyle.grey, row=1)
     async def btn_listing_expiry(self, interaction, btn):
         async def selected(parent, inter2, item):
-            current = (item.get("item_expires_at") or "")[:10]
+            current = "0 0"
             async def submit(inter3, value):
-                value = value.strip()
+                value = value.strip() or "0 0"
+                expiry = listing_expiry_from_duration(value)
+                if expiry is False:
+                    await inter3.response.send_message(
+                        "❌ Use `days hours` with hours from 0 to 23. Use `0 0` for permanent.",
+                        ephemeral=True,
+                    )
+                    return
                 conn = get_db()
-                if not value:
-                    conn.execute(
-                        "UPDATE shop_items SET item_expires_at=NULL WHERE id=? AND guild_id=?",
-                        (item["id"], self.guild.id),
-                    )
-                    message = f"✅ Listing expiry removed from **{item['name']}**."
-                else:
-                    try:
-                        from datetime import date as _date
-                        parsed = _date.fromisoformat(value)
-                    except ValueError:
-                        conn.close()
-                        await inter3.response.send_message(
-                            "❌ Use the date format **YYYY-MM-DD**.",
-                            ephemeral=True,
-                        )
-                        return
-                    conn.execute(
-                        "UPDATE shop_items SET item_expires_at=? WHERE id=? AND guild_id=?",
-                        (parsed.isoformat() + "T23:59:59", item["id"], self.guild.id),
-                    )
-                    message = f"✅ **{item['name']}** listing expires on **{parsed.isoformat()}**."
+                conn.execute(
+                    "UPDATE shop_items SET item_expires_at=? WHERE id=? AND guild_id=?",
+                    (expiry, item["id"], self.guild.id),
+                )
                 conn.commit()
                 conn.close()
+                message = (
+                    f"✅ Listing expiry removed from **{item['name']}**."
+                    if expiry is None
+                    else f"✅ **{item['name']}** listing expiry set to **{value}**."
+                )
                 await inter3.response.send_message(message, ephemeral=True)
                 await self._refresh(parent)
             await inter2.response.send_modal(Modal1(
                 "Listing Expiry",
-                "Date YYYY-MM-DD (empty = never)",
-                placeholder="2026-12-31",
+                "Duration days hours (0 0 = permanent)",
+                placeholder="7 12",
                 default=current,
                 required=False,
                 callback=submit,
@@ -6963,7 +7335,7 @@ class ShopEditMenu(_SubMenu):
         await self._pick_item(
             interaction,
             "Choose an item to edit its listing expiry",
-            lambda item: f"Current: {(item.get('item_expires_at') or 'never')[:10]}",
+            lambda item: f"Current: {listing_expiry_label(item)}",
             selected,
         )
 
@@ -7134,7 +7506,7 @@ class ShopOptionsMenu(_SubMenu):
             "❌ No items have limited stock configured.",
             "👁️ Stock count is now shown",
             "🔇 Stock count is now hidden",
-            lambda item: item.get("stock") is not None,
+            lambda item: bool(item.get("reward_stock_required")),
         )
 
     @discord.ui.button(label="🔒 Require Approval", style=discord.ButtonStyle.grey, row=1)
@@ -7384,16 +7756,19 @@ class ConfigShopMenu(_SubMenu):
     @discord.ui.button(label="➕ Add Item", style=discord.ButtonStyle.green, row=0)
     async def btn_add(self, interaction, btn):
         config = db_get_config(self.guild.id)
-        async def submit(inter, name, price, stock, duration, text_label):
+        async def submit(inter, name, price, image_url, duration, text_label):
             try:
                 parsed_price = int(price)
-                parsed_duration = int(duration)
-                parsed_stock = int(stock.strip()) if stock.strip() else 0
-                if parsed_price <= 0 or parsed_duration < 0 or parsed_stock < 0:
+                duration_parts = duration.strip().split()
+                if len(duration_parts) not in (1, 2):
+                    raise ValueError
+                parsed_days = int(duration_parts[0])
+                parsed_hours = int(duration_parts[1]) if len(duration_parts) == 2 else 0
+                if parsed_price <= 0 or parsed_days < 0 or parsed_hours < 0 or parsed_hours > 23:
                     raise ValueError
             except ValueError:
                 await inter.response.send_message(
-                    "❌ Price must be positive; duration and stock must be 0 or greater.",
+                    "❌ Price must be positive; expiry must be `days hours` with hours from 0 to 23.",
                     ephemeral=True,
                 )
                 return
@@ -7401,18 +7776,19 @@ class ConfigShopMenu(_SubMenu):
                 self.guild.id,
                 name.strip(),
                 parsed_price,
-                None,
-                1 if parsed_duration else 0,
-                parsed_duration or None,
+                image_url.strip() or None,
+                1 if parsed_days or parsed_hours else 0,
+                parsed_days or None,
                 1,
                 1 if text_label.strip() else 0,
                 text_label.strip() or None,
-                stock=parsed_stock or None,
+                stock=None,
+                duration_hours=parsed_hours,
             )
             await inter.response.send_message(
                 f"✅ Added **{name.strip()}** for **{cur(config, parsed_price)}** "
                 f"(ID: `{item_id}`).\n"
-                "Use **Edit Items → Set Image** if you want to add an image.",
+                "Add reward keys in **Rewards & Stock** to make the item purchasable.",
                 ephemeral=True,
             )
             await self._refresh(interaction)
@@ -7546,7 +7922,7 @@ class ConfigShopMenu(_SubMenu):
                 color=C_GOLD,
             )
             if item.get("image_url"):
-                embed.set_image(url=item["image_url"])
+                embed.set_thumbnail(url=item["image_url"])
             embeds.append(embed)
         try:
             for start in range(0, len(embeds), 10):
@@ -8250,30 +8626,29 @@ class LegacyAdminShopMenu(discord.ui.View):
     @discord.ui.button(label="➕ Add Item",   style=discord.ButtonStyle.green, row=0)
     async def btn_add(self, interaction: discord.Interaction, btn):
         cfg_add = db_get_config(self.guild.id)
-        async def submit(inter, v_name, v_price, v_stock, v_temp, v_text):
+        async def submit(inter, v_name, v_price, v_image, v_temp, v_text):
             try:
-                price = int(v_price); days = int(v_temp)
-                if price <= 0 or days < 0: raise ValueError
+                price = int(v_price)
+                parts = v_temp.strip().split()
+                if len(parts) not in (1, 2):
+                    raise ValueError
+                days = int(parts[0])
+                hours = int(parts[1]) if len(parts) == 2 else 0
+                if price <= 0 or days < 0 or hours < 0 or hours > 23:
+                    raise ValueError
             except ValueError:
-                await inter.response.send_message("❌ Invalid price or duration.", ephemeral=True)
+                await inter.response.send_message("❌ Use a positive price and expiry `days hours` (hours 0-23). Use `0 0` for permanent.", ephemeral=True)
                 return
-            try:
-                stock_val = int(v_stock.strip()) if v_stock.strip() else 0
-                if stock_val < 0: raise ValueError
-            except ValueError:
-                await inter.response.send_message("❌ Stock must be 0 (unlimited) or a positive number.", ephemeral=True)
-                return
-            stock_db = stock_val if stock_val > 0 else None
             item_id = db_add_shop_item(
-                self.guild.id, v_name.strip(), price, None,
-                1 if days > 0 else 0, days if days > 0 else None, 1,
+                self.guild.id, v_name.strip(), price, v_image.strip() or None,
+                1 if days or hours else 0, days or None, 1,
                 1 if v_text.strip() else 0, v_text.strip() or None,
-                stock=stock_db
+                stock=None, duration_hours=hours
             )
-            stock_info = f" · 📦 {stock_val} in stock" if stock_db else " · unlimited stock"
             await inter.response.send_message(
-                f"✅ Added **{v_name.strip()}** (ID: `{item_id}`){stock_info}\n"
-                f"💡 Set an image via **🖼️ Set Image URL**.", ephemeral=True)
+                f"✅ Added **{v_name.strip()}** (ID: `{item_id}`).\n"
+                "Add reward keys in **🔑 Rewards & Stock** to make the item purchasable.",
+                ephemeral=True)
             await self._refresh(interaction)
         await interaction.response.send_modal(Modal5("Add Shop Item", currency_label=cfg_add.get("currency_name") or "Gems", callback=submit))
 
@@ -8422,7 +8797,7 @@ class LegacyAdminShopMenu(discord.ui.View):
 
     @discord.ui.button(label="📅 Set Expiry",   style=discord.ButtonStyle.grey,    row=2)
     async def btn_set_expiry(self, interaction: discord.Interaction, btn):
-        """Set or clear the listing expiry date for a shop item (YYYY-MM-DD)."""
+        """Set or clear a relative listing expiry duration."""
         items = db_get_shop_items(self.guild.id)
         if not items:
             await interaction.response.send_message("❌ Shop is empty.", ephemeral=True)
@@ -8432,7 +8807,7 @@ class LegacyAdminShopMenu(discord.ui.View):
             discord.SelectOption(
                 label=f"{i['name'][:60]} — {cur(cfg, i['price'])}",
                 value=str(i["id"]),
-                description=f"Expires {i['item_expires_at'][:10]}" if i.get("item_expires_at") else "No expiry",
+                description=f"Expires in {listing_expiry_label(i)}",
             ) for i in items[:25]
         ]
         view      = discord.ui.View(timeout=60)
@@ -8443,39 +8818,32 @@ class LegacyAdminShopMenu(discord.ui.View):
         async def on_select(inter2):
             item_id = int(sel.values[0])
             chosen  = next((i for i in all_items if i["id"] == item_id), None)
-            cur_exp = (chosen.get("item_expires_at") or "")[:10] if chosen else ""
+            cur_exp = "0 0"
             async def expiry_submit(inter3, value):
-                v = value.strip()
-                if not v:
-                    # Clear expiry
-                    conn = get_db()
-                    conn.execute("UPDATE shop_items SET item_expires_at=NULL WHERE id=? AND guild_id=?",
-                                 (item_id, guild_ref.id))
-                    conn.commit(); conn.close()
+                expiry = listing_expiry_from_duration(value.strip() or "0 0")
+                if expiry is False:
                     await inter3.response.send_message(
-                        f"✅ Expiry removed from **{chosen['name']}** — listing never expires.", ephemeral=True)
+                        "❌ Use `days hours` with hours from 0 to 23. Use `0 0` for permanent.",
+                        ephemeral=True,
+                    )
+                    return
+                conn = get_db()
+                conn.execute(
+                    "UPDATE shop_items SET item_expires_at=? WHERE id=? AND guild_id=?",
+                    (expiry, item_id, guild_ref.id),
+                )
+                conn.commit()
+                conn.close()
+                if expiry is None:
+                    message = f"✅ Expiry removed from **{chosen['name']}** — listing is permanent."
                 else:
-                    # Parse and validate date
-                    try:
-                        from datetime import date as _date
-                        parsed = _date.fromisoformat(v)
-                        iso_str = parsed.isoformat() + "T23:59:59"
-                    except ValueError:
-                        await inter3.response.send_message(
-                            "❌ Invalid date. Use **YYYY-MM-DD** format (e.g. `2026-12-31`).", ephemeral=True)
-                        return
-                    conn = get_db()
-                    conn.execute("UPDATE shop_items SET item_expires_at=? WHERE id=? AND guild_id=?",
-                                 (iso_str, item_id, guild_ref.id))
-                    conn.commit(); conn.close()
-                    await inter3.response.send_message(
-                        f"✅ **{chosen['name']}** will expire on **{parsed.isoformat()}** "
-                        f"and be hidden from the shop after that date.", ephemeral=True)
+                    message = f"✅ **{chosen['name']}** listing expiry set to **{value.strip()}**."
+                await inter3.response.send_message(message, ephemeral=True)
                 await self._refresh(parent)
             await inter2.response.send_modal(Modal1(
                 f"Set Expiry — {chosen['name'][:40] if chosen else '?'}",
-                label="Expiry date (YYYY-MM-DD) — empty to remove",
-                placeholder="2026-12-31",
+                label="Duration days hours (0 0 = permanent)",
+                placeholder="7 12",
                 default=cur_exp,
                 required=False,
                 callback=expiry_submit,
@@ -8488,10 +8856,10 @@ class LegacyAdminShopMenu(discord.ui.View):
     async def btn_toggle_stock_vis(self, interaction: discord.Interaction, btn):
         """Toggle whether remaining stock count is shown to members in /shop."""
         items = db_get_shop_items(self.guild.id)
-        stock_items = [i for i in items if i.get("stock") is not None]
+        stock_items = [i for i in items if i.get("reward_stock_required")]
         if not stock_items:
             await interaction.response.send_message(
-                "❌ No items have a stock limit set. Add stock when creating an item.", ephemeral=True)
+                "❌ No key-backed items exist. Add reward keys to an item first.", ephemeral=True)
             return
         cfg = db_get_config(self.guild.id)
         options = [
@@ -8528,7 +8896,8 @@ class LegacyAdminShopMenu(discord.ui.View):
 # ══════════════════════════════════════════════════════════════
 
 async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: discord.Member,
-                                   shop_item: dict, item_text: Optional[str]) -> Optional[discord.TextChannel]:
+                                   shop_item: dict, item_text: Optional[str],
+                                   reserved_reward: Optional[str] = None) -> Optional[discord.TextChannel]:
     """Create a ticket channel for a purchase and notify all Meeple Owners via DM."""
     config = db_get_config(guild.id)
     manager_role_id    = config.get("manager_role_id")
@@ -8579,7 +8948,7 @@ async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: dis
         C_GOLD
     )
     if shop_item.get("image_url"):
-        ticket_embed.set_image(url=shop_item["image_url"])
+        ticket_embed.set_thumbnail(url=shop_item["image_url"])
     if shop_item.get("provided_by"):
         ticket_embed.add_field(name="🤝 Provided by", value=shop_item["provided_by"], inline=True)
     ticket_embed.set_footer(text="Review the request and close this channel when done.")
@@ -8589,27 +8958,36 @@ async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: dis
     except Exception as ex:
         print(f"[Ticket] Could not send ticket message: {ex}")
 
-    # ── Auto-distribute pre-loaded reward if available ──────────
-    reward_text = None
+    # ── Deliver the atomically reserved reward, if any ──────────
+    reward_text = reserved_reward
     item_id = shop_item.get("id")
-    if item_id:
+    # A reward is only claimed here for legacy/direct callers that did not
+    # reserve it in the purchase transaction. Normal purchases pass the
+    # reserved value and must never consume a second key.
+    if item_id and reward_text is None and not shop_item.get("reward_stock_required"):
         available = db_count_available_rewards(item_id, guild.id)
         if available > 0:
             reward_text = db_claim_next_reward(item_id, guild.id, buyer.id)
-            if reward_text:
-                remaining = db_count_available_rewards(item_id, guild.id)
-                try:
-                    reward_embed = E(
-                        "🔑 Your Reward",
-                        f"**Item:** {shop_item['name']}\n"
-                        f"**Buyer:** {buyer.mention}\n\n"
-                        f"```\n{reward_text}\n```\n"
-                        f"_({remaining} reward(s) remaining in stock)_",
-                        C_SUCCESS
-                    )
-                    await ticket_ch.send(embed=reward_embed)
-                except Exception as ex:
-                    print(f"[Ticket] Could not send reward: {ex}")
+    if reward_text:
+        remaining = db_count_available_rewards(item_id, guild.id) if item_id else 0
+        try:
+            reward_embed = E(
+                "🔑 Your Reward",
+                f"**Item:** {shop_item['name']}\n"
+                f"**Buyer:** {buyer.mention}\n\n"
+                f"{format_reward_for_discord(reward_text)}\n"
+                f"_({remaining} reward(s) remaining in stock)_",
+                C_SUCCESS
+            )
+            await ticket_ch.send(embed=reward_embed)
+        except Exception as ex:
+            print(f"[Ticket] Could not send reward: {ex}")
+
+    db_register_purchase_ticket(ticket_ch.id, guild.id, buyer.id, shop_item["name"])
+    try:
+        await ticket_ch.send(view=PurchaseTicketView(guild, buyer.id, manager_role_id))
+    except Exception as ex:
+        print(f"[Ticket] Could not send ticket controls: {ex}")
 
     # Log the purchase
     await bot_log(bot, guild.id, "🛒 Shop Purchase",
@@ -8618,7 +8996,7 @@ async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: dis
                   f"**Price:** {cur(config, shop_item['price'])}\n"
                   f"**Ticket:** {ticket_ch.mention}"
                   + (f"\n**Info:** {item_text}" if item_text else "")
-                  + (f"\n**Auto-reward sent:** `{reward_text}`" if reward_text else ""),
+                + (f"\n**Auto-reward sent:** {format_reward_for_discord(reward_text)}" if reward_text else ""),
                   C_GOLD)
 
     # ── DM role members (if purchase DMs are enabled) ────────────
@@ -8635,9 +9013,22 @@ async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: dis
                 f"**Buyer:** {buyer.mention} ({buyer.display_name})\n"
                 f"**Price:** {cur(config, shop_item['price'])}"
                 + (f"\n**Info:** {item_text}" if item_text else "")
-                + (f"\n**Reward sent:** `{reward_text}`" if reward_text else "")
+                + (f"\n**Reward sent:** {format_reward_for_discord(reward_text)}" if reward_text else "")
                 + f"\n\n**Ticket channel:** {ticket_ch.mention}",
                 C_GOLD
+            )
+            dm_embed.description = render_dm_template(
+                config.get("dm_template_purchase"),
+                {
+                    "server": guild.name,
+                    "item": shop_item["name"],
+                    "buyer": buyer.display_name,
+                    "price": cur(config, shop_item["price"]),
+                    "ticket": ticket_ch.mention,
+                    "reward": format_reward_for_discord(reward_text) if reward_text else "",
+                    "gems": shop_item["price"],
+                },
+                dm_embed.description,
             )
             dm_sent_count = 0
             for m in dm_role.members:
@@ -8658,6 +9049,70 @@ async def _create_purchase_ticket(bot_instance, guild: discord.Guild, buyer: dis
                               C_INFO)
 
     return ticket_ch
+
+
+class PurchaseTicketView(discord.ui.View):
+    """Persistent buyer/staff controls for purchase tickets."""
+
+    def __init__(self, guild: discord.Guild = None, buyer_id: int = None,
+                 manager_role_id: int = None):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.buyer_id = buyer_id
+        self.manager_role_id = manager_role_id
+
+    async def _record(self, channel_id: int):
+        return next(
+            (row for row in db_get_open_purchase_tickets() if row["channel_id"] == channel_id),
+            None,
+        )
+
+    async def _can_manage(self, interaction: discord.Interaction, record: dict) -> bool:
+        if interaction.user.id == record["buyer_id"]:
+            return True
+        config = db_get_config(interaction.guild.id)
+        return is_xp_manager(interaction.user, config)
+
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.grey,
+                       custom_id="purchase_ticket:close")
+    async def close_ticket(self, interaction: discord.Interaction, button):
+        record = await self._record(interaction.channel.id)
+        if not record:
+            await interaction.response.send_message("⚠️ This ticket is already closed.", ephemeral=True)
+            return
+        if not await self._can_manage(interaction, record):
+            await interaction.response.send_message(
+                "❌ Only the buyer or a Gems Owner can close this ticket.", ephemeral=True)
+            return
+        db_close_purchase_ticket(interaction.channel.id)
+        await interaction.response.send_message("✅ Ticket closed. The channel can now be deleted by staff.", ephemeral=True)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="🗑️ Delete Ticket", style=discord.ButtonStyle.red,
+                       custom_id="purchase_ticket:delete")
+    async def delete_ticket(self, interaction: discord.Interaction, button):
+        record = await self._record(interaction.channel.id)
+        if not record:
+            await interaction.response.send_message("⚠️ This ticket is already closed.", ephemeral=True)
+            return
+        config = db_get_config(interaction.guild.id)
+        if not is_xp_manager(interaction.user, config):
+            await interaction.response.send_message(
+                "❌ Only a Gems Owner can delete a ticket.", ephemeral=True)
+            return
+        db_close_purchase_ticket(interaction.channel.id)
+        await interaction.response.send_message("🗑️ Deleting this ticket…", ephemeral=True)
+        try:
+            await interaction.channel.delete(reason="Purchase ticket closed by staff")
+        except discord.Forbidden:
+            await interaction.followup.send("❌ I cannot delete this channel.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 class PendingPurchaseView(discord.ui.View):
@@ -8702,17 +9157,36 @@ class PendingPurchaseView(discord.ui.View):
                 )
                 self._resolved = False
                 return
-            new_bal = db_add_xp(self.guild.id, self.buyer.id, -self.shop_item["price"])
-            db_decrement_stock(self.shop_item["id"], self.guild.id)
+            reserved_reward, new_bal, purchase_status = db_purchase_reserve_reward_and_charge(
+                self.shop_item["id"], self.guild.id, self.buyer.id, self.shop_item["price"]
+            )
+            if purchase_status == "out_of_stock":
+                await interaction.response.send_message(
+                    "❌ This item is out of stock.", ephemeral=True
+                )
+                self._resolved = False
+                return
+            if purchase_status != "ok":
+                await interaction.response.send_message(
+                    f"❌ Cannot approve — {self.buyer.mention} no longer has enough "
+                    f"{cur(config)}.", ephemeral=True
+                )
+                self._resolved = False
+                return
             expires_at = None
-            if self.shop_item.get("is_temporary") and self.shop_item.get("duration_days"):
-                expires_at = (datetime.now() + timedelta(days=self.shop_item["duration_days"])).isoformat()
+            duration_days = int(self.shop_item.get("duration_days") or 0)
+            duration_hours = int(self.shop_item.get("duration_hours") or 0)
+            if self.shop_item.get("is_temporary") and (duration_days or duration_hours):
+                expires_at = (
+                    datetime.now() + timedelta(days=duration_days, hours=duration_hours)
+                ).isoformat()
             db_add_inventory(self.guild.id, self.buyer.id, self.shop_item["name"], expires_at, self.item_text)
             db_resolve_pending_purchase(self.purchase_id, "approved", resolver.id)
 
             # Create ticket
             ticket_ch = await _create_purchase_ticket(
-                self.bot_ref, self.guild, self.buyer, self.shop_item, self.item_text
+                self.bot_ref, self.guild, self.buyer, self.shop_item, self.item_text,
+                reserved_reward=reserved_reward
             )
             # DM buyer
             try:
@@ -8826,8 +9300,8 @@ class ShopView(discord.ui.View):
         page_items = self.items[start:start + self.PER_PAGE]
 
         for idx, item in enumerate(page_items):
-            # Determine if item is sold out (limited stock that hit 0)
-            sold_out = item.get("stock") is not None and item["stock"] == 0
+            available_keys = db_item_available_reward_count(item, self.guild.id)
+            sold_out = available_keys == 0
 
             # Custom Discord emojis (e.g. <:gems:123>) cannot be rendered inside
             # a button label — Discord shows them as raw text.  They must be
@@ -8911,14 +9385,16 @@ class ShopView(discord.ui.View):
             price_str = f"{c_emoji} **{item['price']:,} {c_name}**"
             extras = []
             if item.get("is_temporary") and item.get("show_duration"):
-                extras.append(f"⏳ {item['duration_days']} days")
+                extras.append(
+                    f"⏳ {format_duration(item.get('duration_days') or 0, item.get('duration_hours') or 0)}"
+                )
             if item.get("requires_text"):
                 extras.append(f"📝 {item.get('text_label') or 'Info required'}")
             ie.description = price_str + ("  •  " + "  •  ".join(extras) if extras else "")
 
             # image — only works when a persistent URL (imgur, etc.) is stored
             if item.get("image_url"):
-                ie.set_image(url=item["image_url"])
+                ie.set_thumbnail(url=item["image_url"])
 
             # Provided-by credit
             if item.get("provided_by"):
@@ -8926,16 +9402,11 @@ class ShopView(discord.ui.View):
 
             # Show stock info only if admin enabled visibility
             item_id = item.get("id")
-            if item_id:
+            if item_id and item.get("reward_stock_required"):
                 avail_rewards = db_count_available_rewards(item_id, self.guild.id)
-                if avail_rewards > 0:
-                    ie.add_field(name="🔑 Rewards in stock", value=f"**{avail_rewards}** — delivered instantly", inline=True)
-                elif item.get("stock") is not None and item.get("show_stock", 0):
-                    stock_left = item["stock"]
-                    if stock_left == 0:
-                        ie.add_field(name="📦 Stock", value="**Sold out**", inline=True)
-                    else:
-                        ie.add_field(name="📦 Stock", value=f"**{stock_left}** remaining", inline=True)
+                if item.get("show_stock", 0):
+                    stock_label = "**Out of Stock**" if avail_rewards == 0 else f"**{avail_rewards}** remaining"
+                    ie.add_field(name="🔑 Reward keys", value=stock_label, inline=True)
 
             # Per-person purchase limit display
             pur_limit = item.get("purchase_limit")
@@ -9012,7 +9483,7 @@ class ShopView(discord.ui.View):
                 return
             # Re-check stock right before purchase to prevent race conditions
             fresh_item = db_get_shop_item(shop_item["id"], self.guild.id)
-            if fresh_item and fresh_item.get("stock") is not None and fresh_item["stock"] == 0:
+            if not fresh_item or not db_item_is_available(shop_item["id"], self.guild.id):
                 msg = "❌ This item is sold out."
                 if inter.response.is_done():
                     await inter.followup.send(msg, ephemeral=True)
@@ -9038,7 +9509,7 @@ class ShopView(discord.ui.View):
                     C_GOLD
                 )
                 if shop_item.get("image_url"):
-                    pending_embed.set_image(url=shop_item["image_url"])
+                    pending_embed.set_thumbnail(url=shop_item["image_url"])
                 pending_embed.set_footer(text=f"Purchase ID: #{purchase_id} — use the buttons to approve or reject")
                 pv = PendingPurchaseView(
                     purchase_id=purchase_id,
@@ -9080,18 +9551,42 @@ class ShopView(discord.ui.View):
                     pass
                 return
 
-            new_bal = db_add_xp(self.guild.id, self.user.id, -shop_item["price"])
-            # Decrement limited stock
-            db_decrement_stock(shop_item["id"], self.guild.id)
+            reserved_reward, new_bal, purchase_status = db_purchase_reserve_reward_and_charge(
+                shop_item["id"], self.guild.id, self.user.id, shop_item["price"]
+            )
+            if purchase_status == "out_of_stock":
+                await notify_item_out_of_stock_once(inter.client, self.guild.id, fresh_item or shop_item)
+                msg = "❌ This item is sold out."
+                if inter.response.is_done():
+                    await inter.followup.send(msg, ephemeral=True)
+                else:
+                    await inter.response.send_message(msg, ephemeral=True)
+                return
+            if purchase_status != "ok":
+                msg = f"❌ Insufficient {cur(config)}."
+                if inter.response.is_done():
+                    await inter.followup.send(msg, ephemeral=True)
+                else:
+                    await inter.response.send_message(msg, ephemeral=True)
+                return
             expires_at = None
-            if shop_item.get("is_temporary") and shop_item.get("duration_days"):
-                expires_at = (datetime.now() + timedelta(days=shop_item["duration_days"])).isoformat()
+            duration_days = int(shop_item.get("duration_days") or 0)
+            duration_hours = int(shop_item.get("duration_hours") or 0)
+            if shop_item.get("is_temporary") and (duration_days or duration_hours):
+                expires_at = (
+                    datetime.now() + timedelta(days=duration_days, hours=duration_hours)
+                ).isoformat()
             db_add_inventory(self.guild.id, self.user.id, shop_item["name"], expires_at, item_text)
 
             # ── Create purchase ticket ──────────────────────────
             ticket_ch = await _create_purchase_ticket(
-                inter.client, self.guild, self.user, shop_item, item_text
+                inter.client, self.guild, self.user, shop_item, item_text,
+                reserved_reward=reserved_reward
             )
+            if fresh_item.get("reward_stock_required") and db_count_available_rewards(
+                fresh_item["id"], self.guild.id
+            ) == 0:
+                await notify_item_out_of_stock_once(inter.client, self.guild.id, fresh_item)
 
             success_msg = (
                 f"✅ **{shop_item['name']}** added to your inventory!\n"
@@ -9300,6 +9795,68 @@ async def check_share_channel_lock():
         window_open = bool(deadline and deadline > now_ts)
         await _set_share_channel_lock(bot, guild_id, locked=not window_open)
 
+
+@tasks.loop(minutes=15)
+async def check_purchase_ticket_reminders():
+    """Edit one reminder message per open purchase ticket when it is due."""
+    await bot.wait_until_ready()
+    now = datetime.utcnow()
+    for ticket in db_get_open_purchase_tickets():
+        config = db_get_config(ticket["guild_id"])
+        if not config.get("ticket_reminder_enabled", 1):
+            continue
+        interval_hours = max(1, _safe_int(config.get("ticket_reminder_interval_hours"), 1))
+        last_raw = ticket.get("last_reminder_at")
+        if last_raw:
+            try:
+                last = datetime.fromisoformat(last_raw)
+            except (TypeError, ValueError):
+                last = None
+            if last and now - last < timedelta(hours=interval_hours):
+                continue
+
+        channel = bot.get_channel(ticket["channel_id"])
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(ticket["channel_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                db_close_purchase_ticket(ticket["channel_id"])
+                continue
+
+        embed = E(
+            "🔔 Purchase Ticket Reminder",
+            f"**Buyer:** <@{ticket['buyer_id']}>\n"
+            f"**Item:** {ticket['item_name']}\n\n"
+            "This purchase ticket is still open. A Gems Owner should review it "
+            "and close the channel when the request is complete.",
+            C_GOLD,
+        )
+        embed.set_footer(text=f"Reminder interval: {interval_hours} hour(s)")
+        message = None
+        message_id = ticket.get("reminder_message_id")
+        if message_id:
+            try:
+                message = await channel.fetch_message(message_id)
+            except discord.NotFound:
+                message = None
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+        try:
+            if message is None:
+                message = await channel.send(embed=embed)
+            else:
+                await message.edit(embed=embed)
+        except discord.NotFound:
+            db_close_purchase_ticket(ticket["channel_id"])
+            continue
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+        db_update_ticket_reminder(
+            ticket["channel_id"],
+            message.id,
+            now.isoformat(),
+        )
+
 # In-memory set tracking (guild_id, video_id, user_id) streak reminder DMs already sent this window.
 # Prevents the 1-minute loop from DMing the same member multiple times.
 _streak_reminder_sent: set = set()
@@ -9400,11 +9957,23 @@ async def check_daily_quests():
             for q in quests:
                 lines.append(f"• {q['quest_name']} — {quest_xp} {c_emoji}")
             try:
-                await member.send(
+                default_message = (
                     f"🗓️ Daily Quests — {guild.name} ({date_key})\n\n"
                     + "\n".join(lines)
                     + f"\n\nComplete them today to earn your rewards!\n"
                     f"Use /quests to track your progress. For the Gems bonus quest, ping the Gems Owner role and ask them to award your bonus. Good luck 🍀"
+                )
+                await member.send(
+                    render_dm_template(
+                        cfg_q.get("dm_template_daily_quest"),
+                        {
+                            "server": guild.name,
+                            "date": date_key,
+                            "quests": "\n".join(lines),
+                            "gems": quest_xp,
+                        },
+                        default_message,
+                    )
                 )
                 conn3 = get_db()
                 conn3.execute(
@@ -9488,7 +10057,17 @@ async def check_new_shop_item_dms():
             C_GOLD,
         )
         if image_url:
-            embed.set_image(url=image_url)
+            embed.set_thumbnail(url=image_url)
+        embed.description = render_dm_template(
+            config.get("dm_template_new_item"),
+            {
+                "server": guild.name,
+                "item": item["name"],
+                "price": cur(config, item["price"]),
+                "gems": item["price"],
+            },
+            embed.description,
+        )
         embed.set_footer(text=f"Shop item ID: {item['id']}")
 
         sent_count = 0
@@ -9572,13 +10151,12 @@ async def send_daily_shop():
             line = f"{c_emoji} **{item['price']:,} {c_name}**"
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
             if item.get("image_url"):
-                ie.set_image(url=item["image_url"])
-            # Footer: remaining stock (replaces "Provided by")
-            if item.get("stock") is not None:
-                if item["stock"] == 0:
-                    ie.set_footer(text="🚫 Sold out")
-                else:
-                    ie.set_footer(text=f"📦 {item['stock']} remaining")
+                ie.set_thumbnail(url=item["image_url"])
+            if item.get("reward_stock_required") and item.get("show_stock", 0):
+                available = db_count_available_rewards(item["id"], guild_id)
+                ie.set_footer(
+                    text="🚫 Out of Stock" if available == 0 else f"🔑 {available} reward key(s) remaining"
+                )
             embeds.append(ie)
         if len(embeds) == 1:   # only the header, no live items
             continue
@@ -9726,8 +10304,10 @@ async def on_ready():
             "The bot is awake and background tasks have been checked.",
             C_SUCCESS,
         )
+    bot.add_view(PurchaseTicketView())
     for loop in [check_youtube, auto_backup, check_expired_items, check_community_goals,
-                 check_streak_reminders, check_share_channel_lock, renew_websub_subscriptions,
+                 check_streak_reminders, check_share_channel_lock, check_purchase_ticket_reminders,
+                 renew_websub_subscriptions,
                  check_daily_quests, check_new_shop_item_dms,
                  send_revive_ping_button, send_daily_shop]:
         if not loop.is_running():
@@ -9994,8 +10574,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     # ── Server tag reward ───────────────────────────────────────
     if config.get("server_tag_enabled", 0):
-        before_tag = getattr(before, "guild_tag", None)
-        after_tag  = getattr(after,  "guild_tag", None)
+        before_tag = member_has_server_tag(before)
+        after_tag  = member_has_server_tag(after)
         if after_tag and not before_tag:
             await _reward_server_tag(after.guild, after, config)
 
