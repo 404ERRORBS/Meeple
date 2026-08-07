@@ -32,12 +32,14 @@ import shutil
 import random
 import traceback
 import logging
+import hashlib
+import io
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web as aiohttp_web
 import hmac
-import hashlib
+from PIL import Image, UnidentifiedImageError
 
 # ══════════════════════════════════════════════════════════════
 #  LOGGING
@@ -789,6 +791,75 @@ def render_dm_template(template: Optional[str], variables: dict, default: str) -
     text = template or default
     values = {str(k): str(v) for k, v in variables.items()}
     return re.sub(r"\{([a-zA-Z0-9_]+)\}", lambda m: values.get(m.group(1), m.group(0)), text)
+
+
+SHOP_IMAGE_CACHE_DIR = os.path.join("/tmp", "meeple-shop-images")
+SHOP_IMAGE_MAX_BYTES = 12 * 1024 * 1024
+SHOP_IMAGE_CANVAS_SIZE = (1200, 675)
+
+
+async def prepare_shop_image(image_url: str, item_id: int | None = None) -> tuple[str, str] | None:
+    """Download and letterbox a shop image so Discord cannot crop its artwork.
+
+    Discord's embed renderer has a constrained image viewport.  Sending a
+    portrait or square source directly with ``set_image`` can make the mobile
+    client hide part of the artwork.  We preserve the complete source aspect
+    ratio inside a 16:9 JPEG canvas, then attach that JPEG to the message.
+    """
+    if not re.fullmatch(r"https?://\S+", str(image_url or "").strip()):
+        return None
+
+    source_url = str(image_url).strip()
+    cache_key = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:24]
+    filename = f"shop-{item_id or 'image'}-{cache_key}.jpg"
+    os.makedirs(SHOP_IMAGE_CACHE_DIR, exist_ok=True)
+    output_path = os.path.join(SHOP_IMAGE_CACHE_DIR, filename)
+    if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+        return output_path, filename
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": "MeepleBot shop image renderer"}
+        ) as session:
+            async with session.get(source_url, timeout=timeout) as response:
+                if response.status != 200:
+                    logger.warning("Shop image download failed: status=%s url=%s", response.status, source_url)
+                    return None
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > SHOP_IMAGE_MAX_BYTES:
+                    logger.warning("Shop image too large: bytes=%s url=%s", content_length, source_url)
+                    return None
+                chunks = []
+                total_bytes = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > SHOP_IMAGE_MAX_BYTES:
+                        logger.warning("Shop image exceeded byte limit: url=%s", source_url)
+                        return None
+                    chunks.append(chunk)
+                source_bytes = b"".join(chunks)
+
+        with Image.open(io.BytesIO(source_bytes)) as source:
+            source.load()
+            source = source.convert("RGBA")
+            source.thumbnail(SHOP_IMAGE_CANVAS_SIZE, Image.Resampling.LANCZOS)
+            canvas = Image.new("RGBA", SHOP_IMAGE_CANVAS_SIZE, (37, 35, 41, 255))
+            left = (canvas.width - source.width) // 2
+            top = (canvas.height - source.height) // 2
+            canvas.alpha_composite(source, (left, top))
+            canvas.convert("RGB").save(
+                output_path,
+                format="JPEG",
+                quality=88,
+                optimize=True,
+                progressive=True,
+            )
+        return output_path, filename
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError,
+            UnidentifiedImageError) as ex:
+        logger.warning("Shop image normalization failed: %s url=%s", ex, source_url)
+        return None
 
 
 def format_reward_for_discord(reward_text: str) -> str:
@@ -9929,7 +10000,28 @@ class ShopView(discord.ui.View):
             if not (i.get("item_expires_at") and i["item_expires_at"] < now_iso)
         ]
         self._msg: Optional[discord.Message] = None  # set by /shop after sending
+        self._image_path: Optional[str] = None
+        self._image_filename: Optional[str] = None
         self._build()
+
+    async def prepare_image(self):
+        """Prepare the current page image as a non-cropping attachment."""
+        self._image_path = None
+        self._image_filename = None
+        start = self.page * self.PER_PAGE
+        page_items = self.items[start:start + self.PER_PAGE]
+        if page_items and page_items[0].get("image_url"):
+            prepared = await prepare_shop_image(
+                page_items[0]["image_url"], page_items[0].get("id")
+            )
+            if prepared:
+                self._image_path, self._image_filename = prepared
+
+    def image_files(self) -> list[discord.File]:
+        """Create fresh file handles for a Discord send/edit operation."""
+        if not self._image_path or not self._image_filename:
+            return []
+        return [discord.File(self._image_path, filename=self._image_filename)]
 
     async def on_timeout(self):
         """Disable all buttons when the shop times out so the message goes dark."""
@@ -10044,10 +10136,13 @@ class ShopView(discord.ui.View):
                 extras.append(f"📝 {item.get('text_label') or 'Info required'}")
             ie.description = price_str + ("  •  " + "  •  ".join(extras) if extras else "")
 
-            # The member-facing shop uses the large embed image.  A thumbnail
-            # is intentionally not used here: Discord constrains thumbnails
-            # to a small box and artwork appears cropped in the normal shop.
-            if item.get("image_url"):
+            # The image is attached after being letterboxed to a safe 16:9
+            # canvas.  This preserves the complete artwork on Discord mobile.
+            if self._image_filename and item.get("id") == page_items[0].get("id"):
+                ie.set_image(url=f"attachment://{self._image_filename}")
+            elif item.get("image_url"):
+                # Keep a graceful fallback if an external image is temporarily
+                # unavailable during preparation.
                 ie.set_image(url=item["image_url"])
 
             # Provided-by credit
@@ -10198,9 +10293,15 @@ class ShopView(discord.ui.View):
                 # Refresh shop
                 self.items = db_get_shop_items(self.guild.id)
                 self._build()
+                await self.prepare_image()
                 try:
-                    if inter.response.is_done():
-                        await inter.edit_original_response(embeds=self.embeds(), view=self)
+                    message = self._msg or getattr(inter, "message", None)
+                    if message:
+                        await message.edit(
+                            embeds=self.embeds(),
+                            attachments=self.image_files(),
+                            view=self,
+                        )
                 except Exception:
                     pass
                 return
@@ -10263,9 +10364,15 @@ class ShopView(discord.ui.View):
             # Refresh shop
             self.items = db_get_shop_items(self.guild.id)
             self._build()
+            await self.prepare_image()
             try:
-                if inter.response.is_done():
-                    await inter.edit_original_response(embeds=self.embeds(), view=self)
+                message = self._msg or getattr(inter, "message", None)
+                if message:
+                    await message.edit(
+                        embeds=self.embeds(),
+                        attachments=self.image_files(),
+                        view=self,
+                    )
             except Exception:
                 pass
 
@@ -10276,14 +10383,26 @@ class ShopView(discord.ui.View):
             await interaction.response.send_message("❌ Not your shop!", ephemeral=True)
             return
         self.page -= 1; self._build()
-        await interaction.response.edit_message(embeds=self.embeds(), view=self)
+        await interaction.response.defer()
+        await self.prepare_image()
+        message = self._msg or interaction.message
+        if message:
+            await message.edit(
+                embeds=self.embeds(), attachments=self.image_files(), view=self
+            )
 
     async def _next(self, interaction: discord.Interaction):
         if interaction.user.id != self.user.id:
             await interaction.response.send_message("❌ Not your shop!", ephemeral=True)
             return
         self.page += 1; self._build()
-        await interaction.response.edit_message(embeds=self.embeds(), view=self)
+        await interaction.response.defer()
+        await self.prepare_image()
+        message = self._msg or interaction.message
+        if message:
+            await message.edit(
+                embeds=self.embeds(), attachments=self.image_files(), view=self
+            )
 
 # ══════════════════════════════════════════════════════════════
 #  BOT SETUP
@@ -12117,13 +12236,17 @@ async def cmd_shop(interaction: discord.Interaction):
         return
     config = db_get_config(interaction.guild_id)
     view = ShopView(interaction.guild, interaction.user)
-    await interaction.response.send_message(embeds=view.embeds(), view=view,
-                                            delete_after=_ttl(config, "msg_ttl_shop"))
+    await interaction.response.defer()
+    await view.prepare_image()
+    message = await interaction.followup.send(
+        embeds=view.embeds(),
+        files=view.image_files(),
+        view=view,
+        delete_after=_ttl(config, "msg_ttl_shop"),
+        wait=True,
+    )
     # Store message ref so on_timeout can disable the buttons
-    try:
-        view._msg = await interaction.original_response()
-    except Exception:
-        pass
+    view._msg = message
     await _prompt_ping_role(interaction)
 
 # ── /inventory ────────────────────────────────────────────────
