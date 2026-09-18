@@ -41,13 +41,18 @@ In Render → **Environment**, add:
 | `TOKEN` | Your Discord bot token |
 | `WEBHOOK_URL` | Your Render app URL (e.g. `https://meeple-bot.onrender.com`) |
 
-### 4. Add a Persistent Disk
-The bot stores its SQLite database (`bot_data.db`) on disk.
-- In Render → **Disks**, add a disk:
-  - **Mount path:** `/opt/render/project/src`
-  - **Size:** 1 GB
+### 4. Database persistence and backups
+The bot stores its SQLite database (`bot_data.db`) locally and also sends
+compressed backups to the configured Discord backup channel.
 
-> **Note:** Because this deployment uses only the five files listed below, add the persistent disk manually in Render.
+Automatic backups are intentionally limited to one every 6 hours per server
+and are skipped when the database has not changed. A manual backup remains
+available from `/config`.
+
+> Render Free Web Services have an ephemeral filesystem and do not support
+> Persistent Disks. The Discord backup channel is therefore the recovery
+> mechanism on the Free plan. A paid Render service can use a Persistent Disk
+> if local database persistence is preferred.
 
 ### 5. Configure the Bot (Discord)
 Use `/config` to set up channels, roles, and features for each server.

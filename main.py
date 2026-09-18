@@ -25,6 +25,7 @@ import sqlite3
 import asyncio
 import aiohttp
 import xml.etree.ElementTree as ET
+import gzip
 import re
 import os
 import json
@@ -131,6 +132,13 @@ def _is_image_attachment(att) -> bool:
 DB_PATH         = "bot_data.db"
 BACKUP_REGISTRY = "backup_channels.json"
 BOT_START_TIME  = datetime.utcnow()   # recorded the instant the process starts
+
+# Automatic backups are deliberately rate-limited because the SQLite database
+# is uploaded to Discord and therefore counts as Render outbound bandwidth.
+# The state is process-local: after a Render restart, one fresh backup is
+# allowed so recovery still gets a current copy.
+AUTO_BACKUP_MIN_INTERVAL = timedelta(hours=6)
+_last_backup_by_guild: dict[int, tuple[int, datetime]] = {}
 
 C_MAIN    = 0x5865F2
 C_SUCCESS = 0x57F287
@@ -2103,10 +2111,13 @@ async def restore_from_discord(bot: commands.Bot):
     Render (and similar platforms) wipe the filesystem on every deploy, so
     backup_channels.json is gone after each restart.  When the registry is
     missing we fall back to scanning every guild's text channels for a .db
-    attachment sent by the bot — this is the self-healing path.  After a
-    successful restore we immediately rebuild the registry from the restored
-    DB so subsequent restarts skip the slow scan.
+    or .db.gz attachment sent by the bot — this is the self-healing path.
+    After a successful restore we immediately rebuild the registry from the
+    restored DB so subsequent restarts skip the slow scan.
     """
+    def is_backup_attachment(attachment) -> bool:
+        return attachment.filename.lower().endswith((".db", ".db.gz"))
+
     registry: dict = {}
 
     # ── Fast path: registry file still exists (in-session restart) ──
@@ -2129,7 +2140,7 @@ async def restore_from_discord(bot: commands.Bot):
                 try:
                     async for msg in channel.history(limit=20):
                         for att in msg.attachments:
-                            if att.filename.endswith(".db"):
+                            if is_backup_attachment(att):
                                 found_ch = channel.id
                                 print(f"[Restore] Found backup in #{channel.name} ({guild.name})")
                                 break
@@ -2141,10 +2152,10 @@ async def restore_from_discord(bot: commands.Bot):
                 registry[str(guild.id)] = found_ch
 
     if not registry:
-        print("[Restore] No .db backup found anywhere — starting fresh.")
+        print("[Restore] No database backup found anywhere — starting fresh.")
         return
 
-    # ── Find the most recent .db attachment across all backup channels ─
+    # ── Find the most recent database attachment across all backup channels ─
     best_message = None
     best_ts = None
     for guild_id_str, ch_id in registry.items():
@@ -2154,7 +2165,7 @@ async def restore_from_discord(bot: commands.Bot):
         try:
             async for msg in ch.history(limit=50):
                 for att in msg.attachments:
-                    if att.filename.endswith(".db"):
+                    if is_backup_attachment(att):
                         if best_ts is None or msg.created_at > best_ts:
                             best_message = msg
                             best_ts = msg.created_at
@@ -2163,10 +2174,10 @@ async def restore_from_discord(bot: commands.Bot):
             print(f"[Restore] Error reading channel {ch_id}: {e}")
 
     if not best_message:
-        print("[Restore] No .db backup found — starting fresh.")
+        print("[Restore] No database backup found — starting fresh.")
         return
 
-    att = next(a for a in best_message.attachments if a.filename.endswith(".db"))
+    att = next(a for a in best_message.attachments if is_backup_attachment(a))
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(att.url) as resp:
@@ -2174,33 +2185,71 @@ async def restore_from_discord(bot: commands.Bot):
                     print(f"[Restore] Download failed — HTTP {resp.status}")
                     return
                 data = await resp.read()
+        if att.filename.lower().endswith(".db.gz"):
+            data = gzip.decompress(data)
         with open("restore_tmp.db", "wb") as f:
             f.write(data)
         shutil.move("restore_tmp.db", DB_PATH)
-        print(f"[Restore] ✅ Restored from {best_ts.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(
+            f"[Restore] ✅ Restored {att.filename} from "
+            f"{best_ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
         # Immediately rebuild the registry so the next restart is fast
         _rebuild_registry_from_db()
     except Exception as e:
         print(f"[Restore] Error downloading backup: {e}")
 
-async def do_backup(bot: commands.Bot, guild_id: int):
+async def do_backup(bot: commands.Bot, guild_id: int, force: bool = False) -> bool:
+    """Upload a compressed database backup.
+
+    Automatic calls skip unchanged databases and are rate-limited per guild.
+    Manual backups pass force=True so an administrator can always create a
+    fresh copy on demand.
+    """
     config = db_get_config(guild_id)
     ch_id = config.get("backup_channel_id")
     if not ch_id:
-        return
+        return False
     ch = bot.get_channel(ch_id)
     if not ch:
-        return
-    backup_path = f"backup_{guild_id}.db"
-    shutil.copy2(DB_PATH, backup_path)
+        return False
+
     try:
+        db_mtime_ns = os.stat(DB_PATH).st_mtime_ns
+    except OSError as e:
+        print(f"[Backup] Database is unavailable: {e}")
+        return False
+
+    now = datetime.utcnow()
+    previous = _last_backup_by_guild.get(guild_id)
+    if not force and previous:
+        previous_mtime_ns, previous_at = previous
+        if (
+            db_mtime_ns <= previous_mtime_ns
+            or now - previous_at < AUTO_BACKUP_MIN_INTERVAL
+        ):
+            return False
+
+    backup_path = f"backup_{guild_id}.db.gz"
+    try:
+        # gzip significantly reduces SQLite files because their contents are
+        # mostly text, indexes, and repeated record structures.
+        with open(DB_PATH, "rb") as source, gzip.open(
+            backup_path, "wb", compresslevel=9
+        ) as compressed:
+            shutil.copyfileobj(source, compressed, length=1024 * 1024)
+
         await ch.send(
-            f"💾 **Automatic backup** — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"💾 **Database backup** — {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+            f"Compressed copy: `{os.path.getsize(backup_path) / 1024 / 1024:.2f} MB`",
             file=discord.File(backup_path)
         )
         _registry_update(guild_id, ch_id)
+        _last_backup_by_guild[guild_id] = (db_mtime_ns, now)
+        return True
     except Exception as e:
         print(f"[Backup] {e}")
+        return False
     finally:
         try:
             os.remove(backup_path)
@@ -8766,8 +8815,10 @@ class AdminMainMenu(discord.ui.View):
             await i.response.send_message("❌ No backup channel configured.", ephemeral=True)
             return
         await i.response.send_message("💾 Running backup...", ephemeral=True)
-        await do_backup(i.client, self.guild.id)
-        await i.followup.send("✅ Backup sent!", ephemeral=True)
+        if await do_backup(i.client, self.guild.id, force=True):
+            await i.followup.send("✅ Compressed backup sent!", ephemeral=True)
+        else:
+            await i.followup.send("❌ Backup could not be sent. Check the bot logs.", ephemeral=True)
 
     @discord.ui.button(label="📊 Server Stats",     style=discord.ButtonStyle.grey, row=1)
     async def cat_stats(self, i: discord.Interaction, b):
@@ -10306,52 +10357,50 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 #  BACKGROUND TASKS
 # ══════════════════════════════════════════════════════════════
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=5)
 async def check_youtube():
     await bot.wait_until_ready()
     conn = get_db()
-    guilds = conn.execute(
+    rows = conn.execute(
         "SELECT guild_id, youtube_channel_id FROM guild_config WHERE youtube_channel_id IS NOT NULL"
     ).fetchall()
     conn.close()
-    for row in guilds:
-        guild_id = row["guild_id"]
-        yt_id    = row["youtube_channel_id"]
+
+    # Several guilds often follow the same channel. Fetch each RSS feed once
+    # per cycle, then process the result for every matching guild.
+    guilds_by_channel: dict[str, list[int]] = {}
+    for row in rows:
+        guilds_by_channel.setdefault(row["youtube_channel_id"], []).append(row["guild_id"])
+
+    for yt_id, guild_ids in guilds_by_channel.items():
         videos   = await fetch_latest_videos(yt_id)
         if not videos:
             continue
         latest  = videos[0]
-        current = db_get_current_video(guild_id)
+        for guild_id in guild_ids:
+            current = db_get_current_video(guild_id)
 
-        # Already tracking this video — nothing to do
-        if current and current["video_id"] == latest["video_id"]:
-            continue
-
-        # ── Anti-regression guard ─────────────────────────────────────
-        # Prevent the RSS feed from overriding a newer manual trigger with
-        # an older cached entry.  This is the root cause of the repeat-ping
-        # bug: after a manual /admin ping the RSS still shows the previous
-        # video for up to 30 min, causing the bot to re-announce it every
-        # poll cycle.
-        #
-        # Rule: if the RSS video was published MORE than 45 minutes before
-        # the current video was detected/set, treat it as stale and skip.
-        # 45 min is generous enough to cover normal RSS lag (~15-30 min)
-        # while still blocking old entries from overriding manual triggers.
-        if current:
-            rss_pub = parse_rss_date(latest.get("published", ""))
-            try:
-                current_det = datetime.fromisoformat(current["detected_at"])
-            except Exception:
-                current_det = None
-            if rss_pub and current_det and rss_pub < current_det - timedelta(minutes=45):
-                print(f"[YouTube] ⏭️  Skipping stale RSS entry {latest['video_id']} "
-                      f"(published {rss_pub} vs current detected {current_det})")
+            # Already tracking this video — nothing to do
+            if current and current["video_id"] == latest["video_id"]:
                 continue
 
-        print(f"[YouTube] 🆕 New video for guild {guild_id}: {latest['video_id']} — {latest.get('title', '')}")
-        db_set_current_video(guild_id, latest["video_id"], latest["url"], latest["title"])
-        await announce_video(bot, guild_id, latest["video_id"], latest["url"], latest["title"])
+            # ── Anti-regression guard ─────────────────────────────────
+            # Prevent the RSS feed from overriding a newer manual trigger
+            # with an older cached entry.
+            if current:
+                rss_pub = parse_rss_date(latest.get("published", ""))
+                try:
+                    current_det = datetime.fromisoformat(current["detected_at"])
+                except Exception:
+                    current_det = None
+                if rss_pub and current_det and rss_pub < current_det - timedelta(minutes=45):
+                    print(f"[YouTube] ⏭️  Skipping stale RSS entry {latest['video_id']} "
+                          f"(published {rss_pub} vs current detected {current_det})")
+                    continue
+
+            print(f"[YouTube] 🆕 New video for guild {guild_id}: {latest['video_id']} — {latest.get('title', '')}")
+            db_set_current_video(guild_id, latest["video_id"], latest["url"], latest["title"])
+            await announce_video(bot, guild_id, latest["video_id"], latest["url"], latest["title"])
 
 @tasks.loop(hours=216)   # 9 days — YouTube leases last 10, renew before expiry
 async def renew_websub_subscriptions():
@@ -10375,8 +10424,13 @@ async def renew_websub_subscriptions():
         await websub_subscribe(cid, callback_url)
         await asyncio.sleep(1)
 
-@tasks.loop(minutes=15)
+@tasks.loop(hours=6)
 async def auto_backup():
+    """Create at most one compressed backup per guild every six hours.
+
+    The backup is skipped when SQLite has not changed since the previous
+    successful automatic upload.
+    """
     await bot.wait_until_ready()
     conn = get_db()
     guilds = conn.execute("SELECT guild_id FROM guild_config WHERE backup_channel_id IS NOT NULL").fetchall()
