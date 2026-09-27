@@ -43,7 +43,7 @@ Set **0** for permanent, or any positive number of seconds to auto-delete.
   belong to the Drops role.
 - **Meeple daily quest:** the ping quest now completes when a member mentions
   the bot in the configured daily-quest chat channel. Meeple replies with a
-  varied response and grants the quest reward.
+  varied English response and grants the quest reward.
 
 ---
 
@@ -64,7 +64,7 @@ Set **0** for permanent, or any positive number of seconds to auto-delete.
   role while excluding Meeple/Gems Owners.
 - Reward additions and edits restart the shop-item notification timer.
 - The daily ping quest now targets Meeple in the configured general channel,
-  uses varied replies, and awards Gems.
+  uses varied English replies, and awards Gems.
 - Existing message visibility, backup, ticket, giveaway, and event controls
   remain available.
 
