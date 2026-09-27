@@ -908,7 +908,7 @@ def shop_discounted_price(item: dict, config: dict) -> int:
     """Return the effective per-guild shop price after its configured discount."""
     try:
         base_price = max(0, int(item.get("price") or 0))
-        discount = max(0, min(100, int(config.get("shop_discount_percent") or 0)))
+        discount = shop_discount_percent_for_config(config)
     except (TypeError, ValueError):
         return max(0, int(item.get("price") or 0))
     return (base_price * (100 - discount)) // 100
@@ -916,7 +916,7 @@ def shop_discounted_price(item: dict, config: dict) -> int:
 
 def shop_price_text(item: dict, config: dict) -> str:
     """Render the effective price and, when active, its crossed-out base price."""
-    discount = max(0, min(100, _safe_int(config.get("shop_discount_percent"), 0)))
+    discount = shop_discount_percent_for_config(config)
     base_price = int(item.get("price") or 0)
     final_price = shop_discounted_price(item, config)
     if discount:
@@ -995,6 +995,76 @@ def listing_expiry_from_duration(value: str) -> str | None | bool:
     if days == 0 and hours == 0:
         return None
     return (datetime.utcnow() + timedelta(days=days, hours=hours)).isoformat()
+
+
+def parse_shop_creation_options(value: str) -> tuple[dict | None, str | None]:
+    """Parse the advanced options entered in the one-step shop creation form."""
+    options = {
+        "usage_days": 0,
+        "usage_hours": 0,
+        "text_label": None,
+        "provided_by": None,
+        "purchase_limit": 1,
+        "requires_approval": False,
+        "rewards": [],
+    }
+    lines = [
+        part.strip()
+        for line in (value or "").splitlines()
+        for part in line.split(";")
+        if part.strip()
+    ]
+    for line in lines:
+        if "=" in line:
+            key, raw_value = line.split("=", 1)
+        elif ":" in line:
+            key, raw_value = line.split(":", 1)
+        else:
+            return None, "Use one option per line, for example `duration=30 0`."
+        key = key.strip().lower().replace("-", "_").replace(" ", "_")
+        raw_value = raw_value.strip()
+        if key in {"duration", "usage_duration", "purchase_duration"}:
+            parsed = parse_duration_days_hours(raw_value or "0 0")
+            if parsed is None:
+                return None, "The purchase duration must use `days hours` (hours 0–23)."
+            options["usage_days"], options["usage_hours"] = parsed
+        elif key in {"text", "text_label", "prompt"}:
+            options["text_label"] = raw_value or None
+        elif key in {"provider", "provided_by", "creator"}:
+            options["provided_by"] = raw_value or None
+        elif key in {"limit", "purchase_limit"}:
+            try:
+                limit = int(raw_value)
+                if limit < 0:
+                    raise ValueError
+            except ValueError:
+                return None, "The purchase limit must be a whole number (1 by default, 0 for unlimited)."
+            options["purchase_limit"] = None if limit == 0 else limit
+        elif key in {"approval", "requires_approval"}:
+            normalized = raw_value.lower()
+            if normalized in {"yes", "y", "true", "1", "required", "on"}:
+                options["requires_approval"] = True
+            elif normalized not in {"no", "n", "false", "0", "none", "off", ""}:
+                return None, "Approval must be `yes` or `no`."
+        elif key in {"rewards", "reward", "codes", "keys"}:
+            options["rewards"].extend(
+                entry.strip() for entry in raw_value.split("|") if entry.strip()
+            )
+        else:
+            return None, f"Unknown shop option `{key}`."
+    return options, None
+
+
+def shop_discount_percent_for_config(config: dict) -> int:
+    """Return the strongest configured or currently active event discount."""
+    base_discount = max(0, min(100, _safe_int(config.get("shop_discount_percent"), 0)))
+    guild_id = config.get("guild_id")
+    if not guild_id:
+        return base_discount
+    try:
+        return max(base_discount, db_get_active_shop_discount(int(guild_id)))
+    except Exception:
+        return base_discount
 
 
 def shop_listing_expired(item: dict, now: datetime = None) -> bool:
@@ -1988,6 +2058,21 @@ def db_get_active_events(guild_id: int) -> list:
     conn.close()
     return [dict(r) for r in rows if event_start(dict(r)) <= now <= event_end(dict(r))]
 
+
+def db_get_active_shop_discount(guild_id: int) -> int:
+    """Return the highest percentage from active temporary shop-discount events."""
+    discount = 0
+    for event in db_get_active_events(guild_id):
+        if event.get("event_type") != "shop_discount":
+            continue
+        try:
+            event_config = json.loads(event.get("config_json") or "{}")
+            discount = max(discount, min(100, max(0, int(event_config.get("discount_percent", 0)))))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return discount
+
+
 def db_get_all_events(guild_id: int) -> list:
     conn = get_db()
     rows = conn.execute("SELECT * FROM events WHERE guild_id=? ORDER BY id DESC", (guild_id,)).fetchall()
@@ -2716,6 +2801,16 @@ async def announce_event_start(bot: commands.Bot, guild_id: int, event: dict):
             f"🎉 **{event['name']}** has started!\n"
             f"All {cur(config)} gains are **×{multiplier}** for **{event_duration_label(event)}**."
         )
+    elif event.get("event_type") == "shop_discount":
+        try:
+            event_config = json.loads(event.get("config_json") or "{}")
+            discount = int(event_config.get("discount_percent", 0))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            discount = 0
+        description = (
+            f"🏷️ **{event['name']}** has started!\n"
+            f"The shop is **{discount}% off** for **{event_duration_label(event)}**."
+        )
     else:
         description = (
             f"🏁 **{event['name']}** is now active!\n"
@@ -3320,7 +3415,7 @@ class Modal5(discord.ui.Modal):
 
 
 class ShopCreateBasicsModal(discord.ui.Modal):
-    """Five-field first step for a complete shop-item creation flow."""
+    """One-step shop creation form with all common item settings."""
 
     def __init__(self, currency_label: str, callback):
         super().__init__(title="Create Shop Item")
@@ -3340,21 +3435,26 @@ class ShopCreateBasicsModal(discord.ui.Modal):
             required=False,
         )
         self.f_listing = discord.ui.TextInput(
-            label="Time listed: days hours (0 0 = no expiry)",
+            label="Listing duration: days hours",
             placeholder="7 12",
             default="0 0",
         )
-        self.f_ownership = discord.ui.TextInput(
-            label="Duration after purchase: days hours",
-            placeholder="30 0 (0 0 = permanent)",
-            default="0 0",
+        self.f_options = discord.ui.TextInput(
+            label="Purchase options (one per line)",
+            placeholder=(
+                "duration=30 0; text=Username; provider=Creator; "
+                "limit=1; approval=no; rewards=CODE-ABC | CODE-XYZ"
+            ),
+            required=False,
+            max_length=4000,
+            style=discord.TextStyle.paragraph,
         )
         for field in (
             self.f_name,
             self.f_price,
             self.f_image,
             self.f_listing,
-            self.f_ownership,
+            self.f_options,
         ):
             self.add_item(field)
 
@@ -3365,7 +3465,7 @@ class ShopCreateBasicsModal(discord.ui.Modal):
             self.f_price.value,
             self.f_image.value,
             self.f_listing.value,
-            self.f_ownership.value,
+            self.f_options.value,
         )
 
 
@@ -3615,7 +3715,7 @@ async def open_shop_item_creation(
     currency_label: str,
     refresh_callback=None,
 ):
-    async def submit(modal_interaction, name, price, image_url, listing_duration, usage_duration):
+    async def submit(modal_interaction, name, price, image_url, listing_duration, options_text):
         try:
             parsed_price = int(price.strip())
             if parsed_price <= 0 or not name.strip():
@@ -3627,42 +3727,53 @@ async def open_shop_item_creation(
             )
             return
         listing_parts = parse_duration_days_hours(listing_duration.strip() or "0 0")
-        usage_parts = parse_duration_days_hours(usage_duration.strip() or "0 0")
-        if listing_parts is None or usage_parts is None:
+        if listing_parts is None:
             await modal_interaction.response.send_message(
-                "❌ Use `days hours` for both durations; hours must be 0–23. "
+                "❌ The listing duration must use `days hours`; hours must be 0–23. "
                 "Use `0 0` for no expiry.",
                 ephemeral=True,
             )
             return
-        state = {
-            "name": name.strip(),
-            "price": parsed_price,
-            "image_url": image_url.strip() or None,
-            "listing_days": listing_parts[0],
-            "listing_hours": listing_parts[1],
-            "usage_days": usage_parts[0],
-            "usage_hours": usage_parts[1],
-            "text_label": None,
-            "provided_by": None,
-            "rewards": [],
-            "requires_approval": False,
-            "purchase_limit": 1,
-        }
-        view = ShopItemCreationView(
-            guild_id,
-            author_id,
-            currency_label,
-            state,
-            refresh_callback,
+        options, options_error = parse_shop_creation_options(options_text)
+        if options_error:
+            await modal_interaction.response.send_message(
+                f"❌ {options_error}",
+                ephemeral=True,
+            )
+            return
+        listing_expiry = listing_expiry_from_duration(
+            f"{listing_parts[0]} {listing_parts[1]}"
         )
+        item_id = db_add_shop_item(
+            guild_id,
+            name.strip(),
+            parsed_price,
+            image_url.strip() or None,
+            1 if options["usage_days"] or options["usage_hours"] else 0,
+            options["usage_days"] or None,
+            1,
+            1 if options["text_label"] else 0,
+            options["text_label"],
+            duration_hours=options["usage_hours"],
+            item_expires_at=listing_expiry,
+            provided_by=options["provided_by"],
+            requires_approval=1 if options["requires_approval"] else 0,
+            purchase_limit=options["purchase_limit"],
+            show_purchase_limit=0,
+        )
+        for reward in options["rewards"]:
+            db_add_item_reward(item_id, guild_id, reward)
         await modal_interaction.response.send_message(
-            "Complete any optional details before saving the item:",
-            embed=view.build_embed(),
-            view=view,
+            f"✅ **{name.strip()}** created for **"
+            f"{cur({'currency_name': currency_label}, parsed_price)}** "
+            f"(ID: `{item_id}`). All settings were saved directly.",
             ephemeral=True,
         )
-        view.message = await modal_interaction.original_response()
+        if refresh_callback:
+            try:
+                await refresh_callback()
+            except Exception:
+                pass
 
     await interaction.response.send_modal(ShopCreateBasicsModal(currency_label, submit))
 
@@ -7577,7 +7688,10 @@ class ConfigEventsMenu(_SubMenu):
         events = db_get_all_events(self.guild.id)
         e = E("🎉 Events", color=C_EVENT)
         if not events:
-            e.description = "No events created yet. Add a Double Bonus event or Community Goal."
+            e.description = (
+                "No events created yet. Add a Double Bonus, Shop Discount, "
+                "Community Goal, or Giveaway event."
+            )
         else:
             now = datetime.now()
             for ev in events[:6]:
@@ -7626,6 +7740,68 @@ class ConfigEventsMenu(_SubMenu):
             "Event name", "Double Bonus Weekend",
             "Duration in days", "7",
             callback=submit
+        ))
+
+    @discord.ui.button(label="🏷️ Add Shop Discount Event", style=discord.ButtonStyle.green, row=0)
+    async def btn_add_shop_discount(self, interaction: discord.Interaction, btn):
+        async def submit(inter, v_name, v_percent, v_days):
+            try:
+                percent = int(v_percent.strip())
+                duration_days = int(v_days.strip())
+                if percent <= 0 or percent > 100 or duration_days <= 0 or duration_days > 365:
+                    raise ValueError
+            except ValueError:
+                await inter.response.send_message(
+                    "❌ Discount must be 1–100% and duration must be 1–365 days.",
+                    ephemeral=True,
+                )
+                return
+            if not v_name.strip():
+                await inter.response.send_message(
+                    "❌ Enter an event name.",
+                    ephemeral=True,
+                )
+                return
+            start_dt = datetime.now()
+            end_dt = start_dt + timedelta(days=duration_days)
+            conn = get_db()
+            event_row = conn.execute(
+                "INSERT INTO events "
+                "(guild_id, name, description, event_type, start_date, end_date, duration_days, config_json) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    self.guild.id,
+                    v_name.strip(),
+                    f"Shop discount: {percent}%",
+                    "shop_discount",
+                    start_dt.isoformat(),
+                    end_dt.isoformat(),
+                    duration_days,
+                    json.dumps({"discount_percent": percent}),
+                ),
+            )
+            event_id = event_row.lastrowid
+            conn.commit()
+            conn.close()
+            created_event = next(
+                (event for event in db_get_all_events(self.guild.id) if event["id"] == event_id),
+                None,
+            )
+            if created_event:
+                await announce_event_start(inter.client, self.guild.id, created_event)
+            await inter.response.send_message(
+                f"✅ Shop discount event **{v_name.strip()}** created: "
+                f"**{percent}% off** for **{duration_days} day(s)**.",
+                ephemeral=True,
+            )
+            await self._refresh(interaction)
+
+        await interaction.response.send_modal(Modal3(
+            "Add Shop Discount Event",
+            "Event name", "Summer Shop Sale",
+            "Discount percentage", "20",
+            "Duration in days", "7",
+            callback=submit,
         ))
 
     @discord.ui.button(label="➕ Add Community Goal", style=discord.ButtonStyle.green, row=0)
@@ -8835,7 +9011,7 @@ class ConfigShopMenu(_SubMenu):
                 ephemeral=True,
             )
 
-    @discord.ui.button(label="🏷️ Shop Discount", style=discord.ButtonStyle.grey, row=2)
+    @discord.ui.button(label="🏷️ Base Shop Discount", style=discord.ButtonStyle.grey, row=2)
     async def btn_shop_discount(self, interaction, button):
         config = db_get_config(self.guild.id)
 
@@ -8852,14 +9028,15 @@ class ConfigShopMenu(_SubMenu):
                 return
             db_set_config(self.guild.id, shop_discount_percent=percent)
             await modal_interaction.response.send_message(
-                f"✅ Shop-wide discount set to **{percent}%**."
-                if percent else "✅ Shop-wide discount turned off.",
+                f"✅ Base shop discount set to **{percent}%**."
+                if percent else "✅ Base shop discount turned off. "
+                "Use `/config → Events → Add Shop Discount Event` for a temporary sale.",
                 ephemeral=True,
             )
             await self._refresh(interaction)
 
         await interaction.response.send_modal(Modal1(
-            title="Shop-wide Discount",
+            title="Base Shop Discount",
             label="Discount percentage (0 = off)",
             placeholder="10",
             default=str(config.get("shop_discount_percent") or 0),

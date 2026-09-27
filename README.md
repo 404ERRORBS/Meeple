@@ -22,16 +22,20 @@ Set **0** for permanent, or any positive number of seconds to auto-delete.
 
 ## Shop and daily quest updates
 
-- **Guided shop item setup:** enter the name, base price, image, time listed, and
-  post-purchase duration first. Optional settings let managers add required
-  customer text, provider credit, reward codes, approval, and a per-member limit.
+- **One-step shop item setup:** the creation form accepts the name, base price,
+  image, listing duration, and advanced purchase settings in one submission.
+  In the final field, use one option per line or separate options with `;`:
+  `duration=30 0`, `text=Username`, `provider=Creator`, `limit=1`,
+  `approval=yes`, and `rewards=CODE-ABC | CODE-XYZ`.
 - **Separate expiration timers:** a listing can expire and disappear from the
   shop independently of how long a purchased item lasts. Expired listings are
   also rejected if a member has an old shop page open.
 - **Purchase limits:** new items default to one purchase per member. The limit
   is hidden from members; managers can change it or set `0` for unlimited.
-- **Shop discount:** configure a guild-wide discount from the Shop settings.
-  The discounted price appears in the shop and is the amount charged, including
+- **Shop discounts:** the existing base discount remains available from Shop
+  settings. Temporary discounts are now events under
+  `/config → Events → Add Shop Discount Event`, with a percentage and duration.
+  The highest active discount is shown and charged consistently, including
   approval-based purchases.
 - **New-item DMs:** after an item has gone 20 minutes without edits, members
   with the configured Drops role receive one DM. Edits and added/changed reward
@@ -40,6 +44,29 @@ Set **0** for permanent, or any positive number of seconds to auto-delete.
 - **Meeple daily quest:** the ping quest now completes when a member mentions
   the bot in the configured daily-quest chat channel. Meeple replies with a
   varied response and grants the quest reward.
+
+---
+
+## Complete change list
+
+- Shop creation is a single form instead of a required follow-up options panel.
+- Shop creation supports the item name, base price, image, listing duration,
+  purchase duration, buyer text prompt, provider, reward codes, approval, and
+  purchase limit.
+- New shop items default to one purchase per member, with the limit hidden.
+- Listing expiration and purchased-item expiration are independent.
+- Expired listings are hidden and cannot be bought through an old shop message.
+- Base shop discounts remain supported.
+- Temporary shop discounts are events with a percentage and duration.
+- Active shop discounts affect shop displays, DMs, approval requests, and the
+  final amount charged.
+- Shop-item DMs wait 20 minutes after the last edit and target the Drops opt-in
+  role while excluding Meeple/Gems Owners.
+- Reward additions and edits restart the shop-item notification timer.
+- The daily ping quest now targets Meeple in the configured general channel,
+  uses varied replies, and awards Gems.
+- Existing message visibility, backup, ticket, giveaway, and event controls
+  remain available.
 
 ---
 
