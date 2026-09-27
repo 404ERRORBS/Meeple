@@ -20,6 +20,29 @@ Set **0** for permanent, or any positive number of seconds to auto-delete.
 
 ---
 
+## Shop and daily quest updates
+
+- **Guided shop item setup:** enter the name, base price, image, time listed, and
+  post-purchase duration first. Optional settings let managers add required
+  customer text, provider credit, reward codes, approval, and a per-member limit.
+- **Separate expiration timers:** a listing can expire and disappear from the
+  shop independently of how long a purchased item lasts. Expired listings are
+  also rejected if a member has an old shop page open.
+- **Purchase limits:** new items default to one purchase per member. The limit
+  is hidden from members; managers can change it or set `0` for unlimited.
+- **Shop discount:** configure a guild-wide discount from the Shop settings.
+  The discounted price appears in the shop and is the amount charged, including
+  approval-based purchases.
+- **New-item DMs:** after an item has gone 20 minutes without edits, members
+  with the configured Drops role receive one DM. Edits and added/changed reward
+  codes restart the quiet period. Gems Owners are excluded, even if they also
+  belong to the Drops role.
+- **Meeple daily quest:** the ping quest now completes when a member mentions
+  the bot in the configured daily-quest chat channel. Meeple replies with a
+  varied response and grants the quest reward.
+
+---
+
 ## Deployment (Render)
 
 ### 1. Push to GitHub
@@ -90,3 +113,4 @@ ID in the Render service logs or in `bot.log`.
 | `requirements.txt` | Python dependencies |
 | `Procfile` | Process declaration for Render/Heroku |
 | `.gitignore` | Excludes DB and secrets from Git |
+| `README.md` | Deployment and feature notes |

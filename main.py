@@ -34,7 +34,7 @@ import random
 import traceback
 import logging
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from aiohttp import web as aiohttp_web
 import hmac
@@ -206,9 +206,8 @@ DAILY_QUEST_POOL = [
     {"key": "dq_invite",     "name": "Invite a new member",                  "type": "dq_invite",   "target": 1},
     {"key": "dq_check_gems", "name": "Check your balance with /gems",        "type": "dq_checkin",  "target": 1},
     {"key": "dq_share_top10","name": "Share and be in the top 10",           "type": "dq_top10",    "target": 1},
-    # dq_get_react: name is resolved at assignment time (see db_assign_daily_quests)
-    # ANY member with the Gems Owner role can trigger this — not only the designated owner.
-    {"key": "dq_get_react",  "name": "Get a gems bonus from a Gems Owner",   "type": "dq_get_react", "target": 1},
+    # The bot mention is resolved at assignment time (see db_assign_daily_quests).
+    {"key": "dq_get_react",  "name": "Ping Meeple in the general chat for a Gems bonus", "type": "dq_get_react", "target": 1},
     # dq_messages: target and channel are resolved at assignment time
     {"key": "dq_messages",   "name": "Send {n} messages in the chat",        "type": "dq_messages", "target": 20},
 ]
@@ -219,6 +218,60 @@ for _q in DAILY_QUEST_POOL:
     _g = _q.get("group")
     if _g:
         _DAILY_QUEST_GROUPS.setdefault(_g, []).append(_q["key"])
+
+DAILY_MEEPLE_REPLIES = [
+    "Tu m’as pingé : le conseil des Meeples confirme que le bonus est à toi.",
+    "Présent ! J’étais justement en train de ne rien faire avec beaucoup de sérieux.",
+    "Ping reçu. Mon détecteur de Gems a fait un petit « ding ».",
+    "Je répondrais avec panache, mais mon budget panache vient d’être dépensé en Gems.",
+    "Meeple au rapport : mission accomplie, trésor livré.",
+    "Tu as invoqué Meeple. Heureusement, les frais d’invocation sont offerts aujourd’hui.",
+    "J’ai entendu mon nom et accouru. Enfin, virtuellement.",
+    "Le ping était si élégant que j’ai ajouté un bonus de style. (Le style est inclus.)",
+    "Un Meeple apparaît ! Il dépose des Gems et repart sans expliquer les règles.",
+    "Ping validé. Mon équipe de comptables en pixels approuve ce transfert.",
+    "Je confirme : tu as bien réveillé le bot. Il est de bonne humeur et de bonne foi.",
+    "La quête est faite. Je vais maintenant retourner à mon activité favorite : attendre.",
+    "Présent et opérationnel. Enfin, surtout présent.",
+    "Ton ping a traversé trois serveurs et une réunion inutile. Voilà tes Gems.",
+    "J’ai vérifié deux fois : c’était bien moi qu’on appelait. Récompense accordée !",
+    "Meeple répond à l’appel. Les Gems aussi, apparemment.",
+    "La cloche a sonné, le bot a répondu, le trésor a changé de propriétaire.",
+    "Ping reçu ! J’ai demandé une fanfare, mais on m’a donné un webhook.",
+    "Le radar Meeple clignotait. Diagnostic : quête terminée, Gems distribuées.",
+    "Je suis là. Pas besoin de laisser un message après le bip.",
+    "Belle invocation. Aucun dé à vingt faces n’a été maltraité pendant cette quête.",
+    "Ping accepté. Je te remets les Gems avant que mon chef ne change d’avis.",
+    "Tu as appelé ? J’étais en mode économie d’énergie, mais la quête passe en priorité.",
+    "Un ping, une réponse, des Gems. Le service client n’a jamais été aussi simple.",
+    "Le bot est sorti de sa boîte pour te remettre ton bonus. C’est son grand jour.",
+    "Présent ! Je n’ai pas de cape, mais j’ai des Gems.",
+    "Le mot magique était « Meeple ». « S’il te plaît » aurait aussi marché.",
+    "Ping traité par un professionnel certifié en distribution de pixels brillants.",
+    "La quête est complétée. Je vais noter ça dans mon CV de bot.",
+    "Je t’ai entendu. Mon écho a demandé s’il pouvait aussi recevoir des Gems.",
+    "Meeple ici. J’apporte des Gems et une quantité raisonnable de confusion.",
+    "Alerte au ping ! Après vérification, tout va bien : tu gagnes ton bonus.",
+    "Réponse automatique ? Non. Réponse très motivée ? Absolument.",
+    "J’étais caché derrière le bouton /shop. Tu m’as trouvé.",
+    "Ping réussi. Tu peux désormais dire que tu as parlé à un bot et qu’il a payé.",
+    "Les Gems sont en route. Elles voyagent en première classe, évidemment.",
+    "Ton ping a été classé « très important » par mon unique neurone.",
+    "Le service Meeple est ouvert. Aujourd’hui, le paiement se fait en Gems.",
+    "Je réponds présent, avec toute la dignité d’un bot qui vient d’être mentionné.",
+    "Quête validée ! J’aurais bien signé le reçu, mais je n’ai pas de main.",
+    "Ping reçu. Je n’ai pas compris la blague, mais j’ai compris « bonus ».",
+    "Tu m’as appelé, j’ai répondu. C’est plus fiable que mon réveil.",
+    "Je confirme que tu existes, que je suis là, et que les Gems sont bien parties.",
+    "Meeple au rendez-vous. La ponctualité est relative, le bonus est réel.",
+    "Ton nom est maintenant inscrit au registre officiel des personnes qui pinguent poliment.",
+    "Je suis arrivé si vite que mon animation de chargement n’a pas eu le temps de finir.",
+    "Ping entendu ! Pas de panique, c’est juste la récompense qui brille.",
+    "La quête est terminée. Tu peux reprendre tes activités mystérieuses.",
+    "J’ai consulté le grand livre des Gems. Il dit : « à payer immédiatement ».",
+    "Le ping est accepté par le comité Meeple, composé de moi-même.",
+    "Je ne suis pas un génie, mais je peux faire apparaître des Gems. Presque pareil.",
+]
 
 # Achievement definitions — add entries to extend
 ACHIEVEMENT_DEFS = [
@@ -280,6 +333,7 @@ def init_db():
         share_xp                  INTEGER DEFAULT 100,
         shop_channel_id           INTEGER,
         quests_channel_id         INTEGER,
+        shop_discount_percent    INTEGER DEFAULT 0,
         prefix_role_id            INTEGER,
         nick_prefix               TEXT    DEFAULT '404 | '
     )""")
@@ -312,6 +366,7 @@ def init_db():
         image_url     TEXT,
         created_at    TEXT,
         new_item_dm_sent INTEGER DEFAULT 0,
+        updated_at    TEXT,
         is_temporary  INTEGER DEFAULT 0,
         duration_days INTEGER,
         show_duration INTEGER DEFAULT 1,
@@ -517,6 +572,7 @@ def init_db():
         "ALTER TABLE shop_items ADD COLUMN image_url TEXT",
         "ALTER TABLE shop_items ADD COLUMN created_at TEXT",
         "ALTER TABLE shop_items ADD COLUMN new_item_dm_sent INTEGER DEFAULT 0",
+        "ALTER TABLE shop_items ADD COLUMN updated_at TEXT",
         "ALTER TABLE shop_items ADD COLUMN is_temporary INTEGER DEFAULT 0",
         "ALTER TABLE shop_items ADD COLUMN duration_days INTEGER",
         "ALTER TABLE shop_items ADD COLUMN show_duration INTEGER DEFAULT 1",
@@ -556,6 +612,7 @@ def init_db():
         "ALTER TABLE guild_config ADD COLUMN share_xp INTEGER DEFAULT 100",
         # Channel routing per command category
         "ALTER TABLE guild_config ADD COLUMN shop_channel_id INTEGER",
+        "ALTER TABLE guild_config ADD COLUMN shop_discount_percent INTEGER DEFAULT 0",
         "ALTER TABLE guild_config ADD COLUMN quests_channel_id INTEGER",
         # Nickname prefix feature
         "ALTER TABLE guild_config ADD COLUMN prefix_role_id INTEGER",
@@ -648,6 +705,12 @@ def init_db():
     # Backfill NULL currency values — ALTER TABLE DEFAULT doesn't update existing rows
     conn.execute("UPDATE guild_config SET currency_emoji='💎' WHERE currency_emoji IS NULL")
     conn.execute("UPDATE guild_config SET currency_name='Gems' WHERE currency_name IS NULL")
+    conn.execute("UPDATE guild_config SET shop_discount_percent=0 WHERE shop_discount_percent IS NULL")
+    conn.execute(
+        "UPDATE shop_items SET updated_at=COALESCE(created_at, datetime('now')), "
+        "new_item_dm_sent=1 "
+        "WHERE updated_at IS NULL"
+    )
     # Existing shop items predate delayed new-item notifications. Mark them as
     # already handled so enabling the feature never sends a surprise backlog
     # of DMs after an upgrade.
@@ -746,6 +809,55 @@ def init_db():
         given_at     TEXT DEFAULT (datetime('now'))
     )""")
 
+    # Product edits restart the 20-minute quiet period before announcing a
+    # shop listing. Purchase notifications only change new_item_dm_sent and
+    # therefore do not keep restarting their own timer.
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS shop_items_touch_updated_at
+        AFTER UPDATE OF name, price, image_url, is_temporary, duration_days,
+            show_duration, requires_text, text_label, notify_admin, stock,
+            duration_hours, reward_stock_required, provided_by,
+            requires_approval, purchase_limit, show_purchase_limit,
+            item_expires_at, show_stock, sort_order
+        ON shop_items
+        BEGIN
+            UPDATE shop_items
+            SET updated_at=strftime('%Y-%m-%dT%H:%M:%f','now'),
+                new_item_dm_sent=0
+            WHERE id=NEW.id AND guild_id=NEW.guild_id;
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS shop_item_rewards_touch_parent
+        AFTER INSERT ON shop_item_rewards
+        BEGIN
+            UPDATE shop_items
+            SET updated_at=strftime('%Y-%m-%dT%H:%M:%f','now'),
+                new_item_dm_sent=0
+            WHERE id=NEW.shop_item_id AND guild_id=NEW.guild_id;
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS shop_item_rewards_edit_touch_parent
+        AFTER UPDATE OF reward_text ON shop_item_rewards
+        BEGIN
+            UPDATE shop_items
+            SET updated_at=strftime('%Y-%m-%dT%H:%M:%f','now'),
+                new_item_dm_sent=0
+            WHERE id=NEW.shop_item_id AND guild_id=NEW.guild_id;
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS shop_item_rewards_delete_touch_parent
+        AFTER DELETE ON shop_item_rewards
+        BEGIN
+            UPDATE shop_items
+            SET updated_at=strftime('%Y-%m-%dT%H:%M:%f','now'),
+                new_item_dm_sent=0
+            WHERE id=OLD.shop_item_id AND guild_id=OLD.guild_id;
+        END
+    """)
+
     conn.commit()
     conn.close()
 
@@ -792,6 +904,29 @@ def cur(config: dict, amount: int = None) -> str:
     return f"{emoji} {name}"
 
 
+def shop_discounted_price(item: dict, config: dict) -> int:
+    """Return the effective per-guild shop price after its configured discount."""
+    try:
+        base_price = max(0, int(item.get("price") or 0))
+        discount = max(0, min(100, int(config.get("shop_discount_percent") or 0)))
+    except (TypeError, ValueError):
+        return max(0, int(item.get("price") or 0))
+    return (base_price * (100 - discount)) // 100
+
+
+def shop_price_text(item: dict, config: dict) -> str:
+    """Render the effective price and, when active, its crossed-out base price."""
+    discount = max(0, min(100, _safe_int(config.get("shop_discount_percent"), 0)))
+    base_price = int(item.get("price") or 0)
+    final_price = shop_discounted_price(item, config)
+    if discount:
+        return (
+            f"~~{cur(config, base_price)}~~ **{cur(config, final_price)}** "
+            f"(-{discount}%)"
+        )
+    return f"**{cur(config, final_price)}**"
+
+
 def render_dm_template(template: Optional[str], variables: dict, default: str) -> str:
     """Expand safe, user-configured DM template variables."""
     text = template or default
@@ -836,7 +971,10 @@ def listing_expiry_label(item: dict) -> str:
     if not expires_at:
         return "Permanent"
     try:
-        remaining = datetime.fromisoformat(expires_at) - datetime.utcnow()
+        expiry = datetime.fromisoformat(expires_at)
+        if expiry.tzinfo:
+            expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+        remaining = expiry - datetime.utcnow()
         seconds = max(0, int(remaining.total_seconds()))
         days, rem = divmod(seconds, 86400)
         hours = rem // 3600
@@ -857,6 +995,23 @@ def listing_expiry_from_duration(value: str) -> str | None | bool:
     if days == 0 and hours == 0:
         return None
     return (datetime.utcnow() + timedelta(days=days, hours=hours)).isoformat()
+
+
+def shop_listing_expired(item: dict, now: datetime = None) -> bool:
+    """Treat malformed listing dates as unavailable and compare timestamps in UTC."""
+    expires_at = item.get("item_expires_at")
+    if not expires_at:
+        return False
+    try:
+        expiry = datetime.fromisoformat(expires_at)
+    except (TypeError, ValueError):
+        return True
+    if expiry.tzinfo:
+        expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+    current = now or datetime.utcnow()
+    if current.tzinfo:
+        current = current.astimezone(timezone.utc).replace(tzinfo=None)
+    return expiry <= current
 
 # ── XP helpers ─────────────────────────────────────────────────
 
@@ -987,17 +1142,23 @@ def db_add_shop_item(guild_id: int, name: str, price: int, image_url: str = None
                      is_temporary: int = 0, duration_days: int = None,
                      show_duration: int = 1, requires_text: int = 0, text_label: str = None,
                      notify_admin: int = 0, stock: int = None,
-                     duration_hours: int = 0) -> int:
+                     duration_hours: int = 0, item_expires_at: str = None,
+                     provided_by: str = None, requires_approval: int = 0,
+                     purchase_limit: int = 1, show_purchase_limit: int = 0) -> int:
     conn = get_db()
     created_at = datetime.utcnow().isoformat()
     c = conn.execute(
         """INSERT INTO shop_items
-           (guild_id, name, price, image_url, created_at, new_item_dm_sent,
+           (guild_id, name, price, image_url, created_at, updated_at, new_item_dm_sent,
             is_temporary, duration_days, show_duration, requires_text, text_label,
-           notify_admin, stock, duration_hours, reward_stock_required)
-           VALUES (?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)""",
-        (guild_id, name, price, image_url, created_at, is_temporary, duration_days,
-         show_duration, requires_text, text_label, notify_admin, stock, duration_hours, 0)
+            notify_admin, stock, duration_hours, reward_stock_required,
+            item_expires_at, provided_by, requires_approval, purchase_limit,
+            show_purchase_limit)
+           VALUES (?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (guild_id, name, price, image_url, created_at, created_at, is_temporary,
+         duration_days, show_duration, requires_text, text_label, notify_admin,
+         stock, duration_hours, 0, item_expires_at, provided_by,
+         requires_approval, purchase_limit, show_purchase_limit)
     )
     item_id = c.lastrowid
     conn.commit()
@@ -1513,6 +1674,17 @@ def db_get_daily_quests(guild_id: int, user_id: int, date_key: str) -> list:
     conn.close()
     return [dict(r) for r in rows]
 
+
+def daily_quest_meeple_name(guild_id: int) -> str:
+    """Build the daily bonus quest around a real bot mention and its chat channel."""
+    config = db_get_config(guild_id)
+    bot_user = getattr(globals().get("bot"), "user", None)
+    mention = f"<@{bot_user.id}>" if bot_user else "Meeple"
+    channel_id = config.get("daily_quest_messages_channel_id")
+    channel = f"<#{channel_id}>" if channel_id else "the general chat"
+    return f"Ping {mention} in {channel} for a Gems bonus"
+
+
 def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: int = 3) -> list:
     """Pick `count` random daily quests for this user if none exist yet.
 
@@ -1524,26 +1696,20 @@ def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: in
     """
     existing = db_get_daily_quests(guild_id, user_id, date_key)
     if existing:
-        # Normalize older assignments that used a specific member instead of the
-        # Gems Owner role. This keeps already-created quests aligned with the
-        # current workflow without changing their progress.
+        # Keep today's assigned task aligned with current bot/channel settings
+        # without resetting its progress.
+        new_bonus_name = daily_quest_meeple_name(guild_id)
         old_bonus = [
             row for row in existing
             if row.get("quest_key") == "dq_get_react"
-            and "Gems Owner role" not in (row.get("quest_name") or "")
+            and row.get("quest_name") != new_bonus_name
         ]
         if old_bonus:
-            legacy_cfg = db_get_config(guild_id)
-            legacy_role_id = legacy_cfg.get("manager_role_id")
-            legacy_role_text = (
-                f"<@&{legacy_role_id}> (Gems Owner role)"
-                if legacy_role_id else "the Gems Owner role"
-            )
             conn_old = get_db()
             conn_old.execute(
                 "UPDATE daily_quests SET quest_name=? "
                 "WHERE guild_id=? AND user_id=? AND date_key=? AND quest_key=?",
-                (f"Ping {legacy_role_text} for a Gems bonus",
+                (new_bonus_name,
                  guild_id, user_id, date_key, "dq_get_react"),
             )
             conn_old.commit()
@@ -1578,10 +1744,7 @@ def db_assign_daily_quests(guild_id: int, user_id: int, date_key: str, count: in
             ch_str     = f"<#{msgs_ch_id}>" if msgs_ch_id else "the chat"
             name       = f"Send {target} messages in {ch_str}"
         elif q["type"] == "dq_get_react":
-            dq_cfg = db_get_config(guild_id)
-            owner_role_id = dq_cfg.get("manager_role_id")
-            role_text = f"<@&{owner_role_id}> (Gems Owner role)" if owner_role_id else "the Gems Owner role"
-            name = f"Ping {role_text} for a Gems bonus"
+            name = daily_quest_meeple_name(guild_id)
         conn.execute(
             "INSERT OR IGNORE INTO daily_quests "
             "(guild_id, user_id, date_key, quest_key, quest_type, quest_target, quest_name) "
@@ -3156,6 +3319,354 @@ class Modal5(discord.ui.Modal):
             await interaction.response.defer()
 
 
+class ShopCreateBasicsModal(discord.ui.Modal):
+    """Five-field first step for a complete shop-item creation flow."""
+
+    def __init__(self, currency_label: str, callback):
+        super().__init__(title="Create Shop Item")
+        self._cb = callback
+        self.f_name = discord.ui.TextInput(
+            label="Item name",
+            placeholder="🎮 Custom Role",
+            max_length=80,
+        )
+        self.f_price = discord.ui.TextInput(
+            label=f"Base price in {str(currency_label)[:30]}",
+            placeholder="500",
+        )
+        self.f_image = discord.ui.TextInput(
+            label="Image URL (optional)",
+            placeholder="https://cdn.discordapp.com/...",
+            required=False,
+        )
+        self.f_listing = discord.ui.TextInput(
+            label="Time listed: days hours (0 0 = no expiry)",
+            placeholder="7 12",
+            default="0 0",
+        )
+        self.f_ownership = discord.ui.TextInput(
+            label="Duration after purchase: days hours",
+            placeholder="30 0 (0 0 = permanent)",
+            default="0 0",
+        )
+        for field in (
+            self.f_name,
+            self.f_price,
+            self.f_image,
+            self.f_listing,
+            self.f_ownership,
+        ):
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self._cb(
+            interaction,
+            self.f_name.value,
+            self.f_price.value,
+            self.f_image.value,
+            self.f_listing.value,
+            self.f_ownership.value,
+        )
+
+
+class ShopItemCreationView(discord.ui.View):
+    """Collect optional listing details before saving the new item."""
+
+    def __init__(
+        self,
+        guild_id: int,
+        author_id: int,
+        currency_label: str,
+        state: dict,
+        refresh_callback=None,
+    ):
+        super().__init__(timeout=600)
+        self.guild_id = guild_id
+        self.author_id = author_id
+        self.currency_label = currency_label
+        self.state = state
+        self.refresh_callback = refresh_callback
+        self.message = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ This creation form belongs to someone else.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def build_embed(self) -> discord.Embed:
+        state = self.state
+        listing_text = format_duration(
+            state["listing_days"], state["listing_hours"]
+        )
+        usage_text = format_duration(
+            state["usage_days"], state["usage_hours"]
+        )
+        reward_count = len(state["rewards"])
+        limit_text = (
+            "unlimited" if state["purchase_limit"] is None
+            else str(state["purchase_limit"])
+        )
+        embed = E(
+            "🛒 New Item · Review",
+            "Add any optional details below, then create the item. "
+            "The item is saved only when you press **Create Item**.",
+            C_GOLD,
+        )
+        embed.add_field(
+            name=state["name"],
+            value=(
+                f"Base price: **{cur({'currency_name': self.currency_label}, state['price'])}**\n"
+                f"Listing expiry: **{listing_text}**\n"
+                f"Duration after purchase: **{usage_text}**\n"
+                f"Purchase limit: **{limit_text}** (hidden from members)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Optional details",
+            value=(
+                f"Image: {'set' if state['image_url'] else 'not set'} · "
+                f"Required text: {state['text_label'] or 'none'} · "
+                f"Provider: {state['provided_by'] or 'not set'} · "
+                f"Reward codes: {reward_count} · "
+                f"Approval: {'required' if state['requires_approval'] else 'not required'}"
+            )[:1024],
+            inline=False,
+        )
+        embed.set_footer(text="The 20-minute availability notification starts after the last edit.")
+        return embed
+
+    async def _refresh_message(self):
+        if self.message:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    async def _single_field(self, interaction, title, label, key, placeholder="", max_length=100):
+        async def submit(modal_interaction, value):
+            self.state[key] = value.strip() or None
+            await modal_interaction.response.send_message(
+                "✅ Saved in the creation form.",
+                ephemeral=True,
+            )
+            await self._refresh_message()
+
+        await interaction.response.send_modal(Modal1(
+            title=title,
+            label=label,
+            placeholder=placeholder,
+            default=self.state.get(key) or "",
+            required=False,
+            max_length=max_length,
+            callback=submit,
+        ))
+
+    @discord.ui.button(label="📝 Required Text", style=discord.ButtonStyle.grey, row=0)
+    async def btn_text(self, interaction, button):
+        await self._single_field(
+            interaction,
+            "Required Purchase Information",
+            "Prompt shown to the buyer (empty = none)",
+            "text_label",
+            "Your game username",
+            45,
+        )
+
+    @discord.ui.button(label="🤝 Provider", style=discord.ButtonStyle.grey, row=0)
+    async def btn_provider(self, interaction, button):
+        await self._single_field(
+            interaction,
+            "Item Provider",
+            "Provider or creator (empty = none)",
+            "provided_by",
+            "Creator or server name",
+        )
+
+    @discord.ui.button(label="🔑 Reward Codes", style=discord.ButtonStyle.grey, row=0)
+    async def btn_rewards(self, interaction, button):
+        async def submit(modal_interaction, value):
+            rewards = [line.strip() for line in value.splitlines() if line.strip()]
+            if not rewards:
+                await modal_interaction.response.send_message(
+                    "❌ Enter at least one reward, one per line.",
+                    ephemeral=True,
+                )
+                return
+            self.state["rewards"] = rewards
+            await modal_interaction.response.send_message(
+                f"✅ {len(rewards)} reward(s) saved in the creation form.",
+                ephemeral=True,
+            )
+            await self._refresh_message()
+
+        await interaction.response.send_modal(Modal1(
+            title="Item Rewards",
+            label="One code or reward link per line",
+            placeholder="CODE-ABC\nhttps://example.com/reward",
+            max_length=4000,
+            paragraph=True,
+            required=False,
+            callback=submit,
+        ))
+
+    @discord.ui.button(label="🔒 Approval", style=discord.ButtonStyle.grey, row=1)
+    async def btn_approval(self, interaction, button):
+        self.state["requires_approval"] = not self.state["requires_approval"]
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="🔢 Purchase Limit", style=discord.ButtonStyle.grey, row=1)
+    async def btn_purchase_limit(self, interaction, button):
+        async def submit(modal_interaction, value):
+            raw = value.strip()
+            if raw == "0":
+                limit = None
+            else:
+                try:
+                    limit = int(raw)
+                    if limit < 1:
+                        raise ValueError
+                except ValueError:
+                    await modal_interaction.response.send_message(
+                        "❌ Enter a positive whole number, or `0` for unlimited.",
+                        ephemeral=True,
+                    )
+                    return
+            self.state["purchase_limit"] = limit
+            await modal_interaction.response.send_message(
+                "✅ Purchase limit saved in the creation form.",
+                ephemeral=True,
+            )
+            await self._refresh_message()
+
+        current = self.state["purchase_limit"]
+        await interaction.response.send_modal(Modal1(
+            title="Per-member Purchase Limit",
+            label="Max purchases (1 default, 0 = unlimited)",
+            placeholder="1",
+            default="0" if current is None else str(current),
+            callback=submit,
+        ))
+
+    @discord.ui.button(label="✅ Create Item", style=discord.ButtonStyle.green, row=1)
+    async def btn_create(self, interaction, button):
+        listing_expiry = listing_expiry_from_duration(
+            f"{self.state['listing_days']} {self.state['listing_hours']}"
+        )
+        if listing_expiry is False:
+            await interaction.response.send_message(
+                "❌ The listing duration is invalid. Reopen the form and try again.",
+                ephemeral=True,
+            )
+            return
+        item_id = db_add_shop_item(
+            self.guild_id,
+            self.state["name"],
+            self.state["price"],
+            self.state["image_url"],
+            1 if self.state["usage_days"] or self.state["usage_hours"] else 0,
+            self.state["usage_days"] or None,
+            1,
+            1 if self.state["text_label"] else 0,
+            self.state["text_label"],
+            duration_hours=self.state["usage_hours"],
+            item_expires_at=listing_expiry,
+            provided_by=self.state["provided_by"],
+            requires_approval=1 if self.state["requires_approval"] else 0,
+            purchase_limit=self.state["purchase_limit"],
+            show_purchase_limit=0,
+        )
+        for reward in self.state["rewards"]:
+            db_add_item_reward(item_id, self.guild_id, reward)
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **{self.state['name']}** created for **"
+                f"{cur({'currency_name': self.currency_label}, self.state['price'])}** "
+                f"(ID: `{item_id}`). The member purchase limit is hidden."
+            ),
+            embed=None,
+            view=None,
+        )
+        if self.refresh_callback:
+            try:
+                await self.refresh_callback()
+            except Exception:
+                pass
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, row=1)
+    async def btn_cancel(self, interaction, button):
+        await interaction.response.edit_message(
+            content="Shop item creation cancelled.",
+            embed=None,
+            view=None,
+        )
+        self.stop()
+
+
+async def open_shop_item_creation(
+    interaction: discord.Interaction,
+    guild_id: int,
+    author_id: int,
+    currency_label: str,
+    refresh_callback=None,
+):
+    async def submit(modal_interaction, name, price, image_url, listing_duration, usage_duration):
+        try:
+            parsed_price = int(price.strip())
+            if parsed_price <= 0 or not name.strip():
+                raise ValueError
+        except ValueError:
+            await modal_interaction.response.send_message(
+                "❌ Enter a name and a positive whole-number price.",
+                ephemeral=True,
+            )
+            return
+        listing_parts = parse_duration_days_hours(listing_duration.strip() or "0 0")
+        usage_parts = parse_duration_days_hours(usage_duration.strip() or "0 0")
+        if listing_parts is None or usage_parts is None:
+            await modal_interaction.response.send_message(
+                "❌ Use `days hours` for both durations; hours must be 0–23. "
+                "Use `0 0` for no expiry.",
+                ephemeral=True,
+            )
+            return
+        state = {
+            "name": name.strip(),
+            "price": parsed_price,
+            "image_url": image_url.strip() or None,
+            "listing_days": listing_parts[0],
+            "listing_hours": listing_parts[1],
+            "usage_days": usage_parts[0],
+            "usage_hours": usage_parts[1],
+            "text_label": None,
+            "provided_by": None,
+            "rewards": [],
+            "requires_approval": False,
+            "purchase_limit": 1,
+        }
+        view = ShopItemCreationView(
+            guild_id,
+            author_id,
+            currency_label,
+            state,
+            refresh_callback,
+        )
+        await modal_interaction.response.send_message(
+            "Complete any optional details before saving the item:",
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True,
+        )
+        view.message = await modal_interaction.original_response()
+
+    await interaction.response.send_modal(ShopCreateBasicsModal(currency_label, submit))
+
+
 async def _await_image_upload(bot: commands.Bot, interaction: discord.Interaction,
                                item_name: str) -> str | None:
     """
@@ -3649,10 +4160,12 @@ def member_tutorial_pages(guild: discord.Guild) -> list:
     shop_ch = config.get("shop_channel_id")
     quests_ch = config.get("quests_channel_id")
     commands_ch = config.get("commands_channel_id")
+    daily_chat_ch = config.get("daily_quest_messages_channel_id")
     share_text = f"<#{share_ch}>" if share_ch else "the share channel"
     shop_text = f"<#{shop_ch}>" if shop_ch else "the shop channel"
     quests_text = f"<#{quests_ch}>" if quests_ch else "the quests channel"
     commands_text = f"<#{commands_ch}>" if commands_ch else "the commands channel"
+    daily_chat_text = f"<#{daily_chat_ch}>" if daily_chat_ch else "the configured general chat"
     return [
         {
             "title": "👋 Welcome to the rewards system",
@@ -3690,7 +4203,7 @@ def member_tutorial_pages(guild: discord.Guild) -> list:
             "description": "Use daily quests for extra rewards and check your progress regularly.",
             "fields": [
                 ("📅 Check progress", f"Use `/quests` in {quests_text} to see your active quests.", False),
-                ("👑 Gems bonus quest", "When a quest asks for a Gems bonus, **ping the Gems Owner role** and ask for the bonus. You must ping the role.", False),
+                ("🤖 Meeple bonus quest", f"When your quest says to ping Meeple, mention the bot in {daily_chat_text}. Meeple replies with your Gems reward.", False),
                 ("Daily reset", "Daily quests refresh automatically. Complete them before the daily reset when possible.", False),
             ],
         },
@@ -3778,7 +4291,7 @@ def config_tutorial_pages(guild: discord.Guild) -> list:
             "description": "Open **👥 Roles** before giving the bot to your team.",
             "fields": [
                 ("Meeple Owner role", "Controls `/admin`, `/config`, manual Gems awards, and purchase handling.", False),
-                ("Share/Ping roles", "Configure the share ping role and the Gems Owner role used by the daily Gems bonus quest.", False),
+                ("Share/Ping roles", "Configure the share ping and other community notification roles. The daily bonus quest is completed by mentioning Meeple in the selected general chat.", False),
                 ("Safety", "Only trusted staff should receive the Meeple Owner role.", False),
             ],
         },
@@ -3798,25 +4311,28 @@ def config_tutorial_pages(guild: discord.Guild) -> list:
             "fields": [
                 ("New members", "Enable Welcome DM for a short introduction. The DM points members to the info channel and tutorial.", False),
                 ("Daily quests", "Toggle Daily Quest DM if you want members to receive their quests privately.", False),
-                ("Shop items", "New Shop Item DM is delayed by 5 minutes by default so you can finish the image, keys, and options first.", False),
+                ("Shop items", "Shop availability DMs go to the Drops interest role after 20 minutes without edits, giving staff time to finish the listing.", False),
                 ("Balance audit", "Use **Balance Change DM Recipient** to set the member who receives a DM whenever a Gems Owner changes a balance from `/admin`.", False),
             ],
         },
         {
             "title": "6️⃣ Build and test the shop",
-            "description": "Open **🛒 Shop**. Add the item first, then configure its image, keys, price, stock, duration, and approval options.",
+            "description": "Open **🛒 Shop** and use the guided creation form to add item details before saving.",
             "fields": [
-                ("Before launch", "Use the preview/test controls. Main shop images use a full embed image so they are not cropped.", False),
+                ("Separate timers", "Choose how long the listing stays in the shop and, separately, how long ownership lasts after purchase. A new item is limited to one purchase per member; the limit is hidden.", False),
+                ("Price", "The configured shop-wide discount is applied to both the displayed price and the amount charged.", False),
+                ("Before launch", "Add optional image, provider, text prompt, reward codes, and approval settings before creating the item.", False),
                 ("After launch", "Purchases create tickets and notify the configured purchase DM role.", False),
             ],
         },
         {
             "title": "7️⃣ Daily quests and community pings",
             "description": (
-                "Use **📋 Daily Quests** to select the member role, reward, chat channel, and the **Gems Owner role**."
+                "Use **📋 Daily Quests** to select the member role, reward, and general chat channel."
             ),
             "fields": [
-                ("Gems bonus quest", "Members must **ping the Gems Owner role** and ask for their Gems bonus. Any member with that role can award it.", False),
+                ("Meeple bonus quest", "Members mention Meeple in the selected chat channel. Meeple replies and awards the configured quest Gems automatically.", False),
+                ("Shop interest", "Set the Drops notification role in **📨 DMs & Welcome**. Members in that role receive the new-item DM after 20 quiet minutes.", False),
                 ("Revive and drops", "Use **🌐 Community** to set separate roles, then use the manual message buttons whenever you want to call them.", False),
             ],
         },
@@ -4583,8 +5099,11 @@ class ConfigDMsMenu(_SubMenu):
         e.add_field(name="⚠️ Streak Reminder DM",       value=_on(config.get("streak_reminder_enabled", 0)),  inline=True)
         e.add_field(name="🗓️ Daily Quest DM",            value=_on(config.get("daily_quest_dm_enabled", 1)),   inline=True)
         e.add_field(name="🆕 New Shop Item DM",           value=_on(config.get("new_item_dm_enabled", 1)),      inline=True)
-        new_item_delay = max(0, _safe_int(config.get("new_item_dm_delay_minutes"), 5))
-        e.add_field(name="⏱️ New Item Delay",             value=f"**{new_item_delay} min**",                  inline=True)
+        e.add_field(
+            name="🎁 Shop Interest Role",
+            value=_role(config.get("drops_ping_role_id")) if config.get("drops_ping_role_id") else "`Not set`",
+            inline=True,
+        )
         e.add_field(name="🎫 Purchase DM (to role)",     value=_on(config.get("purchase_dm_enabled", 1)),       inline=True)
         dm_role_val = _role(config.get("purchase_dm_role_id")) if config.get("purchase_dm_role_id") else "`Meeple Owner (default)`"
         e.add_field(name="📬 Purchase DM Role",          value=dm_role_val,                                     inline=True)
@@ -4625,9 +5144,9 @@ class ConfigDMsMenu(_SubMenu):
             "**Welcome on Role Assign** — triggers welcome msg when member gets this role\n"
             "**Streak Reminder** — DMs members with <5 min left to share and keep their streak\n"
             "**Daily Quest DM** — enable or disable the daily quest DMs\n"
-            "**New Shop Item DM** — notify the Meeple Owner role about newly created shop items\n"
+            "**New Shop Item DM** — DM members in the Drops notification role 20 minutes after an item is last edited\n"
             "**Balance Change DM Recipient** — personally DM this member after a manual balance change in /admin\n"
-            "**New Item Delay** — wait before notifying, default **5 minutes** so images and rewards can be added\n"
+            "**Shop Interest Role** — members opted into the Drops notification role receive shop availability DMs; it is never sent to Meeple Owners by default\n"
             "**Purchase DM** — enable/disable DM notifications when a purchase ticket opens\n"
             "**Purchase DM Role** — role that receives purchase DMs (default: Meeple Owner)\n"
             "**Ticket Reminders** — edit one reminder message per open ticket instead of posting duplicates\n"
@@ -4863,33 +5382,40 @@ class ConfigDMsMenu(_SubMenu):
             callback=submit,
         ))
 
-    @discord.ui.button(label="New Item Delay", style=discord.ButtonStyle.grey, row=4)
-    async def btn_new_item_delay(self, interaction: discord.Interaction, btn):
+    @discord.ui.button(label="Shop Interest Role", style=discord.ButtonStyle.grey, row=4)
+    async def btn_shop_interest_role(self, interaction: discord.Interaction, btn):
         config = db_get_config(self.guild.id)
 
         async def submit(inter, value):
-            try:
-                delay = int(value.strip())
-                if delay < 0 or delay > 10080:
-                    raise ValueError
-            except ValueError:
+            if not value.strip():
+                db_set_config(self.guild.id, drops_ping_role_id=None)
                 await inter.response.send_message(
-                    "❌ Enter a whole number from 0 to 10080 minutes.",
+                    "✅ Shop availability DMs disabled until a Drops interest role is selected.",
+                    ephemeral=True,
+                )
+                await self._refresh(interaction)
+                return
+            role_id = parse_role_id(value)
+            if not role_id:
+                await inter.response.send_message(
+                    "❌ Mention a role or enter its numeric ID.",
                     ephemeral=True,
                 )
                 return
-            db_set_config(self.guild.id, new_item_dm_delay_minutes=delay)
+            db_set_config(self.guild.id, drops_ping_role_id=role_id)
             await inter.response.send_message(
-                f"✅ New shop item DM delay set to **{delay} minute(s)**.",
+                f"✅ Members with <@&{role_id}> will receive shop availability DMs "
+                "after an item has been unchanged for 20 minutes.",
                 ephemeral=True,
             )
             await self._refresh(interaction)
 
         await interaction.response.send_modal(Modal1(
-            title="New Item DM Delay",
-            label="Delay in minutes (0 = immediately)",
-            placeholder="5",
-            default=str(config.get("new_item_dm_delay_minutes") or 5),
+            title="Shop Interest Role",
+            label="Role mention or ID (empty = disable shop DMs)",
+            placeholder="@Drops Notifications  or  1234567890",
+            default=str(config.get("drops_ping_role_id") or ""),
+            required=False,
             callback=submit,
         ))
 
@@ -5260,17 +5786,11 @@ class ConfigDailyQuestsMenu(_SubMenu):
         xp = config.get("daily_quest_xp", 50)
         e.add_field(name="Reward per Quest",    value=f"**{xp}** {config.get('currency_emoji','💎')}", inline=True)
         e.add_field(name="💬 Chat Channel",     value=_ch(config.get("daily_quest_messages_channel_id")), inline=True)
-        gems_owner_role = config.get("manager_role_id")
-        e.add_field(
-            name="👑 Gems Owner Role",
-            value=f"<@&{gems_owner_role}>" if gems_owner_role else "`Not set`",
-            inline=True,
-        )
+        e.add_field(name="🤖 Bonus Quest", value="Ping Meeple in the chat channel", inline=True)
         e.add_field(name="\u200b", value=(
             "Members with the Quest Role receive 3 random daily quests each day.\n"
             "If DM Enabled, they receive a DM at UTC midnight with their quests.\n"
-            "**Chat Channel** — channel counted for the 'send messages' quest (shown as clickable #channel).\n"
-            "**Gems Owner Role** — members must ping this role when asking for a Gems bonus."
+            "**Chat Channel** — general/chat channel used for both the message-count task and the Meeple-ping task."
         ), inline=False)
         return e
 
@@ -5337,7 +5857,7 @@ class ConfigDailyQuestsMenu(_SubMenu):
 
     @discord.ui.button(label="💬 Chat Channel", style=discord.ButtonStyle.blurple, row=2)
     async def btn_chat_ch(self, interaction: discord.Interaction, btn):
-        """Set the channel that counts for the 'send messages' daily quest."""
+        """Set the general channel for message-count and Meeple-ping daily quests."""
         config = db_get_config(self.guild.id)
         async def submit(inter, value):
             if not value.strip():
@@ -5350,7 +5870,7 @@ class ConfigDailyQuestsMenu(_SubMenu):
                 db_set_config(self.guild.id, daily_quest_messages_channel_id=ch_id)
                 await inter.response.send_message(
                     f"✅ Chat channel set to <#{ch_id}>.\n"
-                    "New 'send messages' quests will show this channel as a clickable link.",
+                    "This channel is used for both the 'send messages' task and the task to ping Meeple.",
                     ephemeral=True)
             await self._refresh(interaction)
         await interaction.response.send_modal(Modal1(
@@ -5358,33 +5878,6 @@ class ConfigDailyQuestsMenu(_SubMenu):
             label="Channel mention or ID (empty = remove)",
             placeholder="#global  or  1234567890",
             default=str(config.get("daily_quest_messages_channel_id") or ""),
-            required=False, callback=submit))
-
-    @discord.ui.button(label="👑 Gems Owner Role", style=discord.ButtonStyle.blurple, row=2)
-    async def btn_owner_uid(self, interaction: discord.Interaction, btn):
-        """Set the role members must ping for the daily Gems bonus quest."""
-        config = db_get_config(self.guild.id)
-        async def submit(inter, value):
-            if not value.strip():
-                db_set_config(self.guild.id, manager_role_id=None)
-                await inter.response.send_message(
-                    "✅ Gems Owner role removed — the quest will show a generic role instruction.",
-                    ephemeral=True)
-            else:
-                raw = value.strip().lstrip("<@&").rstrip(">")
-                if not raw.isdigit():
-                    await inter.response.send_message(
-                        "❌ Mention the role or paste its ID.", ephemeral=True); return
-                db_set_config(self.guild.id, manager_role_id=int(raw))
-                await inter.response.send_message(
-                    f"✅ Gems Owner role set to <@&{raw}>. Members must ping this role for their Gems bonus.",
-                    ephemeral=True)
-            await self._refresh(interaction)
-        await interaction.response.send_modal(Modal1(
-            title="Gems Owner Role",
-            label="Role mention or ID (empty = remove)",
-            placeholder="@Gems Owner  or  1234567890",
-            default=str(config.get("manager_role_id") or ""),
             required=False, callback=submit))
 
 
@@ -6000,45 +6493,16 @@ class LegacyConfigShopMenu(_SubMenu):
 
     @discord.ui.button(label="➕ Add Item", style=discord.ButtonStyle.green, row=0)
     async def btn_add(self, interaction: discord.Interaction, btn):
-        guild_ref = self.guild
-        config = db_get_config(guild_ref.id)
-        c_name = config.get("currency_name") or "Gems"
-        async def submit(inter, v_name, v_price, v_image, v_temp, v_text):
-            try:
-                price = int(v_price)
-                if price <= 0: raise ValueError
-            except ValueError:
-                await inter.response.send_message("❌ Price must be a positive number.", ephemeral=True)
-                return
-            try:
-                parts = v_temp.strip().split()
-                if len(parts) not in (1, 2):
-                    raise ValueError
-                days = int(parts[0])
-                hours = int(parts[1]) if len(parts) == 2 else 0
-                if days < 0 or hours < 0 or hours > 23:
-                    raise ValueError
-            except ValueError:
-                await inter.response.send_message("❌ Expiry must be `days hours`; hours must be 0-23. Use `0 0` for permanent.", ephemeral=True)
-                return
-            is_temp       = 1 if days > 0 or hours > 0 else 0
-            dur_days      = days if days > 0 else None
-            requires_text = 1 if v_text.strip() else 0
-            text_label    = v_text.strip() or None
-            item_id = db_add_shop_item(guild_ref.id, v_name.strip(), price, v_image.strip() or None,
-                                       is_temp, dur_days, 1, requires_text, text_label,
-                                       stock=None, duration_hours=hours)
-            tags = []
-            if is_temp:        tags.append(f"⏳ {days}d {hours}h")
-            if requires_text:  tags.append(f"📝 requires text")
-            await inter.response.send_message(
-                f"✅ Added **{v_name.strip()}** — **{cur(config, price)}** (ID: `{item_id}`)\n"
-                f"🔑 Add reward keys in **🔑 Rewards & Stock**."
-                + ("\n" + "  ".join(tags) if tags else "\nPermanent · Add reward keys to enable stock"),
-                ephemeral=True
-            )
+        config = db_get_config(self.guild.id)
+        async def refresh_panel():
             await self._refresh(interaction)
-        await interaction.response.send_modal(Modal5("Add Shop Item", currency_label=c_name, callback=submit))
+        await open_shop_item_creation(
+            interaction,
+            self.guild.id,
+            self.author_id,
+            config.get("currency_name") or "Gems",
+            refresh_panel,
+        )
 
     @discord.ui.button(label="🖼️ Set Image URL", style=discord.ButtonStyle.blurple, row=1)
     async def btn_set_image(self, interaction: discord.Interaction, btn):
@@ -6757,8 +7221,6 @@ class LegacyConfigShopMenu(_SubMenu):
             await interaction.followup.send(
                 f"❌ Cannot find channel <#{ch_id}>. Check bot permissions.", ephemeral=True)
             return
-        c_name  = config.get("currency_name")  or "Gems"
-        c_emoji = config.get("currency_emoji") or "💎"
         shop_ch = config.get("shop_channel_id") or config.get("commands_channel_id")
         shop_ch_str = f"<#{shop_ch}>" if shop_ch else "the shop channel"
         embeds = []
@@ -6769,12 +7231,11 @@ class LegacyConfigShopMenu(_SubMenu):
         )
         header.timestamp = datetime.utcnow()
         embeds.append(header)
-        now_iso = datetime.utcnow().isoformat()
         live_count = 0
         for item in items:
-            if item.get("item_expires_at") and item["item_expires_at"] < now_iso:
+            if shop_listing_expired(item):
                 continue
-            line = f"{c_emoji} **{item['price']:,} {c_name}**"
+            line = shop_price_text(item, config)
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
             # Daily shop keeps the artwork as a compact right-side thumbnail.
             # Discord preserves the source aspect ratio in this slot.
@@ -6826,12 +7287,7 @@ class ConfigQuestsMenu(_SubMenu):
         daily_xp = config.get("daily_quest_xp", 50)
         e.add_field(name="Reward per Quest",   value=f"**{daily_xp}** {config.get('currency_emoji','💎')}", inline=True)
         e.add_field(name="💬 Chat Channel",    value=_ch(config.get("daily_quest_messages_channel_id")),   inline=True)
-        gems_owner_role = config.get("manager_role_id")
-        e.add_field(
-            name="👑 Gems Owner Role",
-            value=f"<@&{gems_owner_role}>" if gems_owner_role else "`Not set`",
-            inline=True,
-        )
+        e.add_field(name="🤖 Bonus Quest", value="Ping Meeple in the chat channel", inline=True)
         e.set_footer(text="Monthly: reset each month, 1 quest/rarity per user  ·  Daily: 3 random quests sent at midnight UTC")
         return e
 
@@ -7000,32 +7456,6 @@ class ConfigQuestsMenu(_SubMenu):
             title="Daily Quest Chat Channel", label="Channel mention or ID (empty = remove)",
             placeholder="#global  or  1234567890",
             default=str(config.get("daily_quest_messages_channel_id") or ""),
-            required=False, callback=submit))
-
-    @discord.ui.button(label="👑 Gems Owner Role", style=discord.ButtonStyle.blurple, row=3)
-    async def btn_daily_owner(self, interaction: discord.Interaction, btn):
-        config = db_get_config(self.guild.id)
-        async def submit(inter, value):
-            if not value.strip():
-                db_set_config(self.guild.id, manager_role_id=None)
-                await inter.response.send_message(
-                    "✅ Gems Owner role removed. The daily bonus quest will show a generic role instruction.",
-                    ephemeral=True)
-            else:
-                raw = value.strip().lstrip("<@&").rstrip(">")
-                if not raw.isdigit():
-                    await inter.response.send_message(
-                        "❌ Mention the role or paste its ID.", ephemeral=True); return
-                db_set_config(self.guild.id, manager_role_id=int(raw))
-                await inter.response.send_message(
-                    f"✅ Gems Owner role set to <@&{raw}>. Members must ping this role for the daily Gems bonus quest.",
-                    ephemeral=True)
-            await self._refresh(interaction)
-        await interaction.response.send_modal(Modal1(
-            title="Gems Owner Role",
-            label="Role mention or ID (empty = remove)",
-            placeholder="@Gems Owner  or  1234567890",
-            default=str(config.get("manager_role_id") or ""),
             required=False, callback=submit))
 
 class ConfigAchievementsMenu(_SubMenu):
@@ -8205,6 +8635,12 @@ class ConfigShopMenu(_SubMenu):
             f"Manage the member shop in one place.\n"
             f"**{len(items)} item(s)** configured using {c_name}."
         )
+        discount_percent = max(0, min(100, _safe_int(config.get("shop_discount_percent"), 0)))
+        e.add_field(
+            name="🏷️ Shop discount",
+            value=f"**{discount_percent}%**" if discount_percent else "`Off`",
+            inline=True,
+        )
         if items:
             for item in items[:8]:
                 tags = []
@@ -8244,47 +8680,15 @@ class ConfigShopMenu(_SubMenu):
     @discord.ui.button(label="➕ Add Item", style=discord.ButtonStyle.green, row=0)
     async def btn_add(self, interaction, btn):
         config = db_get_config(self.guild.id)
-        async def submit(inter, name, price, image_url, duration, text_label):
-            try:
-                parsed_price = int(price)
-                duration_parts = duration.strip().split()
-                if len(duration_parts) not in (1, 2):
-                    raise ValueError
-                parsed_days = int(duration_parts[0])
-                parsed_hours = int(duration_parts[1]) if len(duration_parts) == 2 else 0
-                if parsed_price <= 0 or parsed_days < 0 or parsed_hours < 0 or parsed_hours > 23:
-                    raise ValueError
-            except ValueError:
-                await inter.response.send_message(
-                    "❌ Price must be positive; expiry must be `days hours` with hours from 0 to 23.",
-                    ephemeral=True,
-                )
-                return
-            item_id = db_add_shop_item(
-                self.guild.id,
-                name.strip(),
-                parsed_price,
-                image_url.strip() or None,
-                1 if parsed_days or parsed_hours else 0,
-                parsed_days or None,
-                1,
-                1 if text_label.strip() else 0,
-                text_label.strip() or None,
-                stock=None,
-                duration_hours=parsed_hours,
-            )
-            await inter.response.send_message(
-                f"✅ Added **{name.strip()}** for **{cur(config, parsed_price)}** "
-                f"(ID: `{item_id}`).\n"
-                "Add reward keys in **Rewards & Stock** to make the item purchasable.",
-                ephemeral=True,
-            )
+        async def refresh_panel():
             await self._refresh(interaction)
-        await interaction.response.send_modal(Modal5(
-            "Add Shop Item",
-            currency_label=config.get("currency_name") or "Gems",
-            callback=submit,
-        ))
+        await open_shop_item_creation(
+            interaction,
+            self.guild.id,
+            self.author_id,
+            config.get("currency_name") or "Gems",
+            refresh_panel,
+        )
 
     @discord.ui.button(label="🗑️ Remove Item", style=discord.ButtonStyle.red, row=0)
     async def btn_remove(self, interaction, btn):
@@ -8392,21 +8796,18 @@ class ConfigShopMenu(_SubMenu):
                 ephemeral=True,
             )
             return
-        currency_name = config.get("currency_name") or "Gems"
-        currency_emoji = config.get("currency_emoji") or "💎"
         shop_channel = config.get("shop_channel_id") or config.get("commands_channel_id")
         embeds = [discord.Embed(
             title="🛍️ Shop Update",
             description=f"Use `/shop` in <#{shop_channel}> to buy!",
             color=C_GOLD,
         )]
-        now_iso = datetime.utcnow().isoformat()
         for item in items:
-            if item.get("item_expires_at") and item["item_expires_at"] < now_iso:
+            if shop_listing_expired(item):
                 continue
             embed = discord.Embed(
                 title=item["name"],
-                description=f"{currency_emoji} **{item['price']:,} {currency_name}**",
+                description=shop_price_text(item, config),
                 color=C_GOLD,
             )
             # This is the compact daily-shop style post, so keep artwork on
@@ -8434,6 +8835,37 @@ class ConfigShopMenu(_SubMenu):
                 ephemeral=True,
             )
 
+    @discord.ui.button(label="🏷️ Shop Discount", style=discord.ButtonStyle.grey, row=2)
+    async def btn_shop_discount(self, interaction, button):
+        config = db_get_config(self.guild.id)
+
+        async def submit(modal_interaction, value):
+            try:
+                percent = int(value.strip())
+                if percent < 0 or percent > 100:
+                    raise ValueError
+            except ValueError:
+                await modal_interaction.response.send_message(
+                    "❌ Enter a whole percentage from 0 to 100 (`0` turns the discount off).",
+                    ephemeral=True,
+                )
+                return
+            db_set_config(self.guild.id, shop_discount_percent=percent)
+            await modal_interaction.response.send_message(
+                f"✅ Shop-wide discount set to **{percent}%**."
+                if percent else "✅ Shop-wide discount turned off.",
+                ephemeral=True,
+            )
+            await self._refresh(interaction)
+
+        await interaction.response.send_modal(Modal1(
+            title="Shop-wide Discount",
+            label="Discount percentage (0 = off)",
+            placeholder="10",
+            default=str(config.get("shop_discount_percent") or 0),
+            callback=submit,
+        ))
+
 # ══════════════════════════════════════════════════════════════
 #  COMMUNITY CONFIG SUBMENU (Boost Announce + Revive Ping)
 # ══════════════════════════════════════════════════════════════
@@ -8450,15 +8882,15 @@ async def send_ping_role_message(channel, kind: str, guild_id: int) -> bool:
         description = "Get a ping when the chat needs a boost."
     elif kind == "drops":
         roles = [("🎁 Drops notifications", drops_role,
-                  "Get pinged when new skin or item links are posted.")]
+                  "Get DMs for new shop items and pings for drop links.")]
         title = "🎁 Drops Notifications"
-        description = "Get a ping when new skin or item links are posted."
+        description = "Get DMs for new shop items and pings for drop links."
     else:
         roles = [
             ("🔔 Revive notifications", revive_role,
              "Get pinged when the chat needs a boost."),
             ("🎁 Drops notifications", drops_role,
-             "Get pinged when new skin or item links are posted."),
+             "Get DMs for new shop items and pings for drop links."),
         ]
         title = "📣 Community Notifications"
         description = "Choose the notifications you want to receive."
@@ -9125,31 +9557,15 @@ class LegacyAdminShopMenu(discord.ui.View):
     @discord.ui.button(label="➕ Add Item",   style=discord.ButtonStyle.green, row=0)
     async def btn_add(self, interaction: discord.Interaction, btn):
         cfg_add = db_get_config(self.guild.id)
-        async def submit(inter, v_name, v_price, v_image, v_temp, v_text):
-            try:
-                price = int(v_price)
-                parts = v_temp.strip().split()
-                if len(parts) not in (1, 2):
-                    raise ValueError
-                days = int(parts[0])
-                hours = int(parts[1]) if len(parts) == 2 else 0
-                if price <= 0 or days < 0 or hours < 0 or hours > 23:
-                    raise ValueError
-            except ValueError:
-                await inter.response.send_message("❌ Use a positive price and expiry `days hours` (hours 0-23). Use `0 0` for permanent.", ephemeral=True)
-                return
-            item_id = db_add_shop_item(
-                self.guild.id, v_name.strip(), price, v_image.strip() or None,
-                1 if days or hours else 0, days or None, 1,
-                1 if v_text.strip() else 0, v_text.strip() or None,
-                stock=None, duration_hours=hours
-            )
-            await inter.response.send_message(
-                f"✅ Added **{v_name.strip()}** (ID: `{item_id}`).\n"
-                "Add reward keys in **🔑 Rewards & Stock** to make the item purchasable.",
-                ephemeral=True)
+        async def refresh_panel():
             await self._refresh(interaction)
-        await interaction.response.send_modal(Modal5("Add Shop Item", currency_label=cfg_add.get("currency_name") or "Gems", callback=submit))
+        await open_shop_item_creation(
+            interaction,
+            self.guild.id,
+            self.author_id,
+            cfg_add.get("currency_name") or "Gems",
+            refresh_panel,
+        )
 
     @discord.ui.button(label="🗑️ Remove",      style=discord.ButtonStyle.red,    row=0)
     async def btn_remove(self, interaction: discord.Interaction, btn):
@@ -9974,10 +10390,9 @@ class ShopView(discord.ui.View):
         self.user  = user
         self.page  = page
         # Filter out items whose listing has expired
-        now_iso = datetime.utcnow().isoformat()
         self.items = [
             i for i in db_get_shop_items(guild.id)
-            if not (i.get("item_expires_at") and i["item_expires_at"] < now_iso)
+            if not shop_listing_expired(i)
         ]
         self._msg: Optional[discord.Message] = None  # set by /shop after sending
         self._build()
@@ -9999,12 +10414,15 @@ class ShopView(discord.ui.View):
         config  = db_get_config(self.guild.id)
         c_emoji = config.get("currency_emoji") or "💎"
         c_name  = config.get("currency_name")  or "Gems"
+        discount = max(0, min(100, _safe_int(config.get("shop_discount_percent"), 0)))
         start      = self.page * self.PER_PAGE
         page_items = self.items[start:start + self.PER_PAGE]
 
         for idx, item in enumerate(page_items):
             available_keys = db_item_available_reward_count(item, self.guild.id)
             sold_out = available_keys == 0
+            sale_price = shop_discounted_price(item, config)
+            discount_label = f" (-{discount}%)" if discount else ""
 
             # Custom Discord emojis (e.g. <:gems:123>) cannot be rendered inside
             # a button label — Discord shows them as raw text.  They must be
@@ -10022,13 +10440,13 @@ class ShopView(discord.ui.View):
                     btn_label = "🚫 Sold Out"
                     btn_emoji = None
                 else:
-                    btn_label = f"✅ Buy — {item['price']:,} {c_name}"
+                    btn_label = f"✅ Buy — {sale_price:,} {c_name}{discount_label}"
             else:
                 btn_emoji = None
                 if sold_out:
                     btn_label = "🚫 Sold Out"
                 else:
-                    btn_label = f"✅ Buy — {c_emoji} {item['price']:,} {c_name}"
+                    btn_label = f"✅ Buy — {c_emoji} {sale_price:,} {c_name}{discount_label}"
 
             btn = discord.ui.Button(
                 label=btn_label,
@@ -10072,7 +10490,10 @@ class ShopView(discord.ui.View):
             )
             return [header]
 
-        can_afford = user_bal >= min(i["price"] for i in page_items) if page_items else True
+        can_afford = (
+            user_bal >= min(shop_discounted_price(i, config) for i in page_items)
+            if page_items else True
+        )
         header.description = (
             f"Your balance: **{c_emoji} {user_bal:,} {c_name}**\n"
             f"Use the **✅ Buy** button below the item to purchase it."
@@ -10085,7 +10506,15 @@ class ShopView(discord.ui.View):
             ie = discord.Embed(title=item["name"], color=C_GOLD)
 
             # price + tags
-            price_str = f"{c_emoji} **{item['price']:,} {c_name}**"
+            sale_price = shop_discounted_price(item, config)
+            discount = max(0, min(100, _safe_int(config.get("shop_discount_percent"), 0)))
+            if discount:
+                price_str = (
+                    f"~~{c_emoji} {item['price']:,} {c_name}~~ "
+                    f"**{c_emoji} {sale_price:,} {c_name}** (-{discount}%)"
+                )
+            else:
+                price_str = f"{c_emoji} **{sale_price:,} {c_name}**"
             extras = []
             if item.get("is_temporary") and item.get("show_duration"):
                 extras.append(
@@ -10113,17 +10542,6 @@ class ShopView(discord.ui.View):
                     stock_label = "**Out of Stock**" if avail_rewards == 0 else f"**{avail_rewards}** remaining"
                     ie.add_field(name="🔑 Reward keys", value=stock_label, inline=True)
 
-            # Per-person purchase limit display
-            pur_limit = item.get("purchase_limit")
-            if pur_limit and item.get("show_purchase_limit", 1):
-                already = db_count_user_purchases(item["name"], self.guild.id, self.user.id)
-                remaining_purchases = max(0, pur_limit - already)
-                ie.add_field(
-                    name="Purchase Limit",
-                    value=f"**{remaining_purchases}/{pur_limit}** remaining for you",
-                    inline=True
-                )
-
             # Approval badge
             if item.get("requires_approval"):
                 ie.add_field(name="🔒 Approval Required", value="A Gems Owner must approve this purchase", inline=True)
@@ -10136,11 +10554,18 @@ class ShopView(discord.ui.View):
             if interaction.user.id != self.user.id:
                 await interaction.response.send_message("❌ This isn't your shop!", ephemeral=True)
                 return
+            if shop_listing_expired(item):
+                await interaction.response.send_message(
+                    "❌ This listing has expired and is no longer available.",
+                    ephemeral=True,
+                )
+                return
             config = db_get_config(self.guild.id)
             user_bal = db_get_xp(self.guild.id, self.user.id)
-            if user_bal < item["price"]:
+            sale_price = shop_discounted_price(item, config)
+            if user_bal < sale_price:
                 await interaction.response.send_message(
-                    f"❌ Not enough {cur(config)}. Need **{item['price']}**, you have **{user_bal}**.",
+                    f"❌ Not enough {cur(config)}. Need **{sale_price}**, you have **{user_bal}**.",
                     ephemeral=True)
                 return
             # ── Per-person purchase limit check ──────────────────
@@ -10149,8 +10574,7 @@ class ShopView(discord.ui.View):
                 already_bought = db_count_user_purchases(item["name"], self.guild.id, self.user.id)
                 if already_bought >= purchase_limit:
                     await interaction.response.send_message(
-                        f"❌ You've reached the purchase limit for **{item['name']}** "
-                        f"(**{purchase_limit}** max per person).",
+                        f"❌ You can't purchase **{item['name']}** again.",
                         ephemeral=True)
                     return
             # If item requires text, ask for it first
@@ -10166,8 +10590,8 @@ class ShopView(discord.ui.View):
             else:
                 view = ConfirmView(interaction.user.id)
                 await interaction.response.send_message(
-                    f"🛒 Buy **{item['name']}** for **{cur(config, item['price'])}**?\n"
-                    f"Remaining: **{cur(config, user_bal - item['price'])}**",
+                    f"🛒 Buy **{item['name']}** for **{cur(config, sale_price)}**?\n"
+                    f"Remaining: **{cur(config, user_bal - sale_price)}**",
                     view=view, ephemeral=True
                 )
                 await view.wait()
@@ -10179,16 +10603,16 @@ class ShopView(discord.ui.View):
         async def _complete_purchase(inter: discord.Interaction, shop_item, item_text: Optional[str]):
             config = db_get_config(self.guild.id)
             check_bal = db_get_xp(self.guild.id, self.user.id)
-            if check_bal < shop_item["price"]:
-                msg = f"❌ Insufficient {cur(config)}."
+            # Re-check stock right before purchase to prevent race conditions
+            fresh_item = db_get_shop_item(shop_item["id"], self.guild.id)
+            if not fresh_item or shop_listing_expired(fresh_item):
+                msg = "❌ This listing has expired and is no longer available."
                 if inter.response.is_done():
                     await inter.followup.send(msg, ephemeral=True)
                 else:
                     await inter.response.send_message(msg, ephemeral=True)
                 return
-            # Re-check stock right before purchase to prevent race conditions
-            fresh_item = db_get_shop_item(shop_item["id"], self.guild.id)
-            if not fresh_item or not db_item_is_available(shop_item["id"], self.guild.id):
+            if not db_item_is_available(shop_item["id"], self.guild.id):
                 msg = "❌ This item is sold out."
                 if inter.response.is_done():
                     await inter.followup.send(msg, ephemeral=True)
@@ -10196,31 +10620,54 @@ class ShopView(discord.ui.View):
                     await inter.response.send_message(msg, ephemeral=True)
                 return
 
+            purchase_limit = fresh_item.get("purchase_limit")
+            if purchase_limit and db_count_user_purchases(
+                fresh_item["name"], self.guild.id, self.user.id
+            ) >= purchase_limit:
+                msg = f"❌ You can't purchase **{fresh_item['name']}** again."
+                if inter.response.is_done():
+                    await inter.followup.send(msg, ephemeral=True)
+                else:
+                    await inter.response.send_message(msg, ephemeral=True)
+                return
+
+            # Price is recalculated from the current guild discount at the
+            # moment the purchase is committed, not from a stale shop page.
+            purchase_item = dict(fresh_item)
+            purchase_item["price"] = shop_discounted_price(fresh_item, config)
+            if check_bal < purchase_item["price"]:
+                msg = f"❌ Insufficient {cur(config)}."
+                if inter.response.is_done():
+                    await inter.followup.send(msg, ephemeral=True)
+                else:
+                    await inter.response.send_message(msg, ephemeral=True)
+                return
+
             # ── Approval flow ─────────────────────────────────────
-            if fresh_item and fresh_item.get("requires_approval"):
+            if purchase_item.get("requires_approval"):
                 # Don't deduct gems yet — create a pending record and wait for owner approval
                 purchase_id = db_add_pending_purchase(
                     self.guild.id, self.user.id,
-                    shop_item["id"], shop_item["name"],
-                    shop_item["price"], item_text
+                    purchase_item["id"], purchase_item["name"],
+                    purchase_item["price"], item_text
                 )
                 # Notify admin channel
                 pending_embed = E(
                     "🔔 Purchase Awaiting Approval",
-                    f"**Item:** {shop_item['name']}\n"
+                    f"**Item:** {purchase_item['name']}\n"
                     f"**Buyer:** {self.user.mention} ({self.user.display_name})\n"
-                    f"**Price:** {cur(config, shop_item['price'])}"
+                    f"**Price:** {cur(config, purchase_item['price'])}"
                     + (f"\n**Info provided:** {item_text}" if item_text else ""),
                     C_GOLD
                 )
-                if shop_item.get("image_url"):
-                    pending_embed.set_thumbnail(url=shop_item["image_url"])
+                if purchase_item.get("image_url"):
+                    pending_embed.set_thumbnail(url=purchase_item["image_url"])
                 pending_embed.set_footer(text=f"Purchase ID: #{purchase_id} — use the buttons to approve or reject")
                 pv = PendingPurchaseView(
                     purchase_id=purchase_id,
                     guild=self.guild,
                     buyer=self.user,
-                    shop_item=fresh_item,
+                    shop_item=purchase_item,
                     item_text=item_text,
                     bot_ref=inter.client
                 )
@@ -10238,7 +10685,7 @@ class ShopView(discord.ui.View):
                     except Exception:
                         pass
                 pending_msg = (
-                    f"⏳ Your purchase request for **{shop_item['name']}** has been submitted!\n"
+                    f"⏳ Your purchase request for **{purchase_item['name']}** has been submitted!\n"
                     f"A Gems Owner will review it shortly. You'll receive a DM when it's approved or rejected.\n"
                     f"*(Your gems will only be deducted if approved.)*"
                 )
@@ -10257,7 +10704,7 @@ class ShopView(discord.ui.View):
                 return
 
             reserved_reward, new_bal, purchase_status = db_purchase_reserve_reward_and_charge(
-                shop_item["id"], self.guild.id, self.user.id, shop_item["price"]
+                purchase_item["id"], self.guild.id, self.user.id, purchase_item["price"]
             )
             if purchase_status == "out_of_stock":
                 await notify_item_out_of_stock_once(inter.client, self.guild.id, fresh_item or shop_item)
@@ -10288,17 +10735,19 @@ class ShopView(discord.ui.View):
                 inter.client, self.guild, self.user, shop_item, item_text,
                 reserved_reward=reserved_reward
             )
-            if fresh_item.get("reward_stock_required") and db_count_available_rewards(
+            if purchase_item.get("reward_stock_required") and db_count_available_rewards(
                 fresh_item["id"], self.guild.id
             ) == 0:
                 await notify_item_out_of_stock_once(inter.client, self.guild.id, fresh_item)
 
             success_msg = (
-                f"✅ **{shop_item['name']}** added to your inventory!\n"
+                f"✅ **{purchase_item['name']}** added to your inventory!\n"
                 f"Remaining balance: **{cur(config, new_bal)}**"
             )
-            if shop_item.get("is_temporary") and shop_item.get("show_duration"):
-                success_msg += f"\n⏳ Expires in **{shop_item['duration_days']} days**"
+            if purchase_item.get("is_temporary") and purchase_item.get("show_duration"):
+                success_msg += (
+                    f"\n⏳ Expires in **{format_duration(purchase_item.get('duration_days') or 0, purchase_item.get('duration_hours') or 0)}**"
+                )
             if ticket_ch:
                 success_msg += f"\n🎫 A ticket has been opened: {ticket_ch.mention}"
             if inter.response.is_done():
@@ -10308,7 +10757,7 @@ class ShopView(discord.ui.View):
             # Notify admin if text was submitted (legacy admin channel notif kept as backup)
             if item_text:
                 e = E("📝 Shop Order — Text Required",
-                      f"**Item:** {shop_item['name']}\n**Buyer:** <@{self.user.id}>\n**Info:** {item_text}",
+                      f"**Item:** {purchase_item['name']}\n**Buyer:** <@{self.user.id}>\n**Info:** {item_text}",
                       C_INFO)
                 await notify_admin(inter.client, self.guild.id, embed=e)
             # Refresh shop
@@ -10703,6 +11152,8 @@ async def check_daily_quests():
                 continue
             cfg_q  = db_get_config(guild_id)
             c_emoji = cfg_q.get("currency_emoji", "💎")
+            general_chat = cfg_q.get("daily_quest_messages_channel_id")
+            general_chat_text = f"<#{general_chat}>" if general_chat else "the configured general chat"
             lines = []
             for q in quests:
                 lines.append(f"• {q['quest_name']} — {quest_xp} {c_emoji}")
@@ -10711,7 +11162,7 @@ async def check_daily_quests():
                     f"🗓️ Daily Quests — {guild.name} ({date_key})\n\n"
                     + "\n".join(lines)
                     + f"\n\nComplete them today to earn your rewards!\n"
-                    f"Use /quests to track your progress. For the Gems bonus quest, ping the Gems Owner role and ask them to award your bonus. Good luck 🍀"
+                    f"Use /quests to track your progress. For the Meeple bonus quest, mention the bot in {general_chat_text}; it will reply and award your Gems. Good luck 🍀"
                 )
                 await member.send(
                     render_dm_template(
@@ -10747,17 +11198,16 @@ async def before_daily_quests():
 
 @tasks.loop(minutes=1)
 async def check_new_shop_item_dms():
-    """DM shop managers once for each new item after the configured delay."""
+    """DM opted-in members once after a listing has been unchanged for 20 minutes."""
     await bot.wait_until_ready()
     conn = get_db()
     items = conn.execute(
         """
-        SELECT si.*, gc.new_item_dm_enabled, gc.new_item_dm_delay_minutes,
-               gc.manager_role_id, gc.purchase_dm_role_id
+        SELECT si.*, gc.new_item_dm_enabled, gc.drops_ping_role_id
         FROM shop_items si
         JOIN guild_config gc ON gc.guild_id = si.guild_id
         WHERE COALESCE(si.new_item_dm_sent, 0)=0
-          AND si.created_at IS NOT NULL
+          AND COALESCE(si.updated_at, si.created_at) IS NOT NULL
           AND COALESCE(gc.new_item_dm_enabled, 1)=1
         """
     ).fetchall()
@@ -10766,11 +11216,12 @@ async def check_new_shop_item_dms():
     now = datetime.utcnow()
     for row in items:
         item = dict(row)
+        modified_at_raw = item.get("updated_at") or item.get("created_at")
         try:
-            created_at = datetime.fromisoformat(item["created_at"])
+            modified_at = datetime.fromisoformat(modified_at_raw)
+            if modified_at.tzinfo:
+                modified_at = modified_at.astimezone(timezone.utc).replace(tzinfo=None)
         except (TypeError, ValueError):
-            # A malformed timestamp must not break notifications for other
-            # guilds; mark this item handled rather than retrying forever.
             conn_bad = get_db()
             conn_bad.execute(
                 "UPDATE shop_items SET new_item_dm_sent=1 WHERE id=? AND guild_id=?",
@@ -10780,30 +11231,52 @@ async def check_new_shop_item_dms():
             conn_bad.close()
             continue
 
-        delay_minutes = max(0, int(item.get("new_item_dm_delay_minutes") or 5))
-        if now < created_at + timedelta(minutes=delay_minutes):
+        if now < modified_at + timedelta(minutes=20):
+            continue
+        if shop_listing_expired(item, now=now):
+            conn_expired = get_db()
+            conn_expired.execute(
+                "UPDATE shop_items SET new_item_dm_sent=1 WHERE id=? AND guild_id=?",
+                (item["id"], item["guild_id"]),
+            )
+            conn_expired.commit()
+            conn_expired.close()
             continue
 
         guild = bot.get_guild(item["guild_id"])
         if not guild:
             continue
 
-        role_id = item.get("purchase_dm_role_id") or item.get("manager_role_id")
+        # The Drops role is the opt-in group for interested members. Never
+        # fall back to manager_role_id or purchase_dm_role_id, and do not DM
+        # Gems Owners even if they also happen to hold the Drops role.
+        role_id = item.get("drops_ping_role_id")
         role = guild.get_role(role_id) if role_id else None
         if not role:
-            # Leave it pending so a manager role configured later can receive
-            # the notification.
             continue
 
         config = db_get_config(guild.id)
+        if item.get("reward_stock_required") and db_count_available_rewards(
+            item["id"], guild.id
+        ) <= 0:
+            conn_sold = get_db()
+            conn_sold.execute(
+                "UPDATE shop_items SET new_item_dm_sent=1 WHERE id=? AND guild_id=?",
+                (item["id"], item["guild_id"]),
+            )
+            conn_sold.commit()
+            conn_sold.close()
+            continue
+
         image_url = item.get("image_url")
+        shop_channel_id = config.get("shop_channel_id") or config.get("commands_channel_id")
+        shop_location = f"<#{shop_channel_id}>" if shop_channel_id else "the shop channel"
+        sale_price = shop_discounted_price(item, config)
         embed = E(
-            "🆕 New Shop Item Ready",
+            "🛍️ New Item Available",
             f"**Item:** {item['name']}\n"
-            f"**Price:** {cur(config, item['price'])}\n"
-            f"**Created:** <t:{int(created_at.timestamp())}:R>\n\n"
-            "Please finish the image, reward keys, stock, and options before "
-            "publishing the shop.",
+            f"**Price:** {shop_price_text(item, config)}\n\n"
+            f"It's ready to buy in `/shop` in {shop_location}.",
             C_GOLD,
         )
         if image_url:
@@ -10813,16 +11286,19 @@ async def check_new_shop_item_dms():
             {
                 "server": guild.name,
                 "item": item["name"],
-                "price": cur(config, item["price"]),
-                "gems": item["price"],
+                "price": cur(config, sale_price),
+                "gems": sale_price,
+                "shop": shop_location,
             },
             embed.description,
         )
-        embed.set_footer(text=f"Shop item ID: {item['id']}")
+        embed.set_footer(
+            text="You receive these DMs because you opted into Drops and shop-item notifications."
+        )
 
         sent_count = 0
         for member in role.members:
-            if member.bot:
+            if member.bot or is_xp_manager(member, config):
                 continue
             try:
                 await member.send(embed=embed)
@@ -10834,23 +11310,22 @@ async def check_new_shop_item_dms():
             except Exception as ex:
                 print(f"[NewItemDM] Failed for {member}: {ex}")
 
-        if sent_count:
-            conn_sent = get_db()
-            conn_sent.execute(
-                "UPDATE shop_items SET new_item_dm_sent=1 WHERE id=? AND guild_id=?",
-                (item["id"], item["guild_id"]),
-            )
-            conn_sent.commit()
-            conn_sent.close()
-            await bot_log(
-                bot,
-                guild.id,
-                "🆕 New Shop Item DM Sent",
-                f"**Item:** {item['name']}\n"
-                f"**Recipients:** {sent_count} member(s) with <@&{role.id}>\n"
-                f"**Delay:** {delay_minutes} minute(s)",
-                C_INFO,
-            )
+        conn_sent = get_db()
+        conn_sent.execute(
+            "UPDATE shop_items SET new_item_dm_sent=1 WHERE id=? AND guild_id=?",
+            (item["id"], item["guild_id"]),
+        )
+        conn_sent.commit()
+        conn_sent.close()
+        await bot_log(
+            bot,
+            guild.id,
+            "🆕 New Shop Item DM Sent",
+            f"**Item:** {item['name']}\n"
+            f"**Recipients:** {sent_count} member(s) with <@&{role.id}>\n"
+            "**Quiet period:** 20 minutes since the last edit",
+            C_INFO,
+        )
 
 
 @check_new_shop_item_dms.before_loop
@@ -10893,12 +11368,11 @@ async def send_daily_shop():
         )
         header.timestamp = datetime.utcnow()
         embeds.append(header)
-        now_iso = datetime.utcnow().isoformat()
         for item in items:
             # Skip items whose listing has expired
-            if item.get("item_expires_at") and item["item_expires_at"] < now_iso:
+            if shop_listing_expired(item):
                 continue
-            line = f"{c_emoji} **{item['price']:,} {c_name}**"
+            line = shop_price_text(item, config)
             ie = discord.Embed(title=item["name"], description=line, color=C_GOLD)
             if item.get("image_url"):
                 ie.set_thumbnail(url=item["image_url"])
@@ -11557,11 +12031,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                   f"**Awarded by:** {actor.mention} ({actor.display_name})\n"
                   f"**Amount:** +{cur(config_r, xp_to_give)}{mult_str}\n"
                   f"**Balance:** {cur(config_r, displayed_balance)}", C_SUCCESS)
-    # Daily quest: the RECIPIENT gets credit for "Get a reaction bonus from a Meeple Owner"
-    if config_r.get("daily_quest_enabled", 0):
-        dq_date = db_today_key()
-        dq_done = db_daily_quest_progress(payload.guild_id, target.id, dq_date, "dq_get_react")
-        await process_daily_quest_completions(bot, payload.guild_id, target.id, dq_done, dq_date)
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
@@ -11616,10 +12085,42 @@ async def on_message(message: discord.Message):
     share_ch_id = config.get("share_channel_id")
     if share_ch_id and message.channel.id == share_ch_id:
         await _handle_share(message, config)
-    # Daily quest: count messages in the configured chat channel
+    # Daily quests run in the configured general/chat channel.
     dq_msgs_ch = config.get("daily_quest_messages_channel_id")
     if dq_msgs_ch and message.channel.id == dq_msgs_ch and config.get("daily_quest_enabled", 0):
         dq_date = db_today_key()
+        # Daily quest: mentioning Meeple completes the one-time bonus task.
+        if bot.user and bot.user in message.mentions:
+            member_quests = db_get_daily_quests(
+                message.guild.id, message.author.id, dq_date
+            )
+            bonus_quest = next(
+                (
+                    quest for quest in member_quests
+                    if quest.get("quest_key") == "dq_get_react"
+                    and not quest.get("completed")
+                ),
+                None,
+            )
+            if bonus_quest:
+                dq_done = db_daily_quest_progress(
+                    message.guild.id, message.author.id, dq_date, "dq_get_react"
+                )
+                if dq_done:
+                    await process_daily_quest_completions(
+                        bot, message.guild.id, message.author.id, dq_done, dq_date
+                    )
+                    reward = _safe_int(config.get("daily_quest_xp"), 50)
+                    try:
+                        await message.reply(
+                            f"{_random.choice(DAILY_MEEPLE_REPLIES)}\n"
+                            f"🎁 {message.author.mention}, **+{cur(config, reward)}**.",
+                            mention_author=False,
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+        # Daily quest: count messages in the configured chat channel.
         dq_done = db_daily_quest_progress(message.guild.id, message.author.id, dq_date, "dq_messages")
         if dq_done:
             await process_daily_quest_completions(bot, message.guild.id, message.author.id, dq_done, dq_date)
